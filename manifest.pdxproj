@@ -1,0 +1,103 @@
+# postui-dmesg — paideia-as build manifest
+#
+# Wave: postui v1 reference apps
+# Milestone: M1 (scaffold + KIND_DMESG poll)
+# Doc: paideia-os/postui/docs/design.md §3.3 (widget mix / data source /
+#      milestone breakdown for /bin/dmesg) — authoritative; this repo's
+#      own STATUS.md is the rollup.
+#
+# postui-dmesg is a userspace TOOL binary (a klog tail viewer with
+# filter) built on top of the postui widget library. Unlike postui
+# itself (kind = library, no _start), postui-dmesg is a program a user
+# launches via `dmesg` at the shell prompt — kind = tool, one _start,
+# one output ELF.
+#
+# ---------------------------------------------------------------------
+# M1-001 landing (paideia-os/postui-dmesg#1)
+# ---------------------------------------------------------------------
+#
+# Scope: app scaffold + fixed-tick KIND_DMESG poll loop populating an
+# in-memory log-line ring. Only src/klog_poll.pdx lands; every other
+# source enumerated below is a milestone forward-declaration and will
+# have a `sources:` entry added as its landing round writes it. The
+# per-file `paideia-as build --emit elf64` step in tools/build.sh
+# compiles every listed source into a loose ELF64 object under
+# build-out/; the final link into build-out/postui-dmesg is a
+# downstream packaging step that lands with M1-005 (_start + main
+# loop bind) — until then this manifest describes a growing loose-
+# object set, not a linkable binary.
+#
+# Mirrors the shape postui-top/manifest.pdxproj established for the
+# same monorepo-satellite pattern (postui-top#1 M1-001).
+
+name        = postui-dmesg
+version     = 0.1.0-pre
+kind        = tool
+# entry lands at M1-005 (_start binder + main render loop). At M1-001
+# there is no _start; the loose-object build via tools/build.sh
+# succeeds per-file but the downstream link step is DEFERRED. Named
+# here as a forward declaration so the M1-005 landing does not need
+# to churn this manifest.
+entry       = Main::main                    # DEFERRED until M1-005; see STATUS.md M1 row
+output      = build-out/postui-dmesg
+caps_decl   = caps.decl
+
+# --- Source list (order-insensitive; paideia-as resolves module deps
+# from `module <Basename> = structure { ... }` headers). Every file
+# listed below is compiled into build-out/<basename>.o by
+# tools/build.sh. M1-001 seeds only src/klog_poll.pdx; the M1-002..
+# M4-004 landings each add their own source entry as the module body
+# lands. Basename PascalCase discipline: klog_poll.pdx -> module
+# KlogPoll (see src/klog_poll.pdx §MODULE NAME).
+sources:
+  - src/klog_poll.pdx             # M1-001: KlogState + klog_poll_init + klog_poll_tick KIND_DMESG consumer
+
+# --- Library dependencies -----------------------------------------------
+# postui (the widget library at ../postui, v1.0.0 shipped at
+# postui-v1.0.0) is the primary dependency; M2 onward will link its
+# object set into the postui-dmesg ELF. At M1-001 postui-dmesg's poll
+# module is pure userspace with a sys_dmesg syscall and no widget
+# calls yet — the dependency is declared here so the M1-005 render
+# landing does not have to introduce it.
+deps:
+  - postui @ ^0.1                 # M2-001: List + TextInput widget consumers land here
+
+# --- Test targets ------------------------------------------------------
+# Populated starting M1-004 (klog_poll_tick fingerprint test —
+# deterministic scratch snapshot + ring-cursor invariant). Every entry
+# below becomes a `paideia-as build --tests` target once the
+# corresponding issue lands.
+# Fail-code family bands for postui-dmesg per design/architecture.md:
+#   test_klog_poll_tick_fingerprint     0xFFFFE01x band  (M1-004)
+tests:
+  # (empty at M1-001; M1-004 adds tests/test_klog_poll_tick_fingerprint.pdx)
+
+# --- Documentation targets ---------------------------------------------
+# .pdxdoc file(s) shipped at M4 packaging time.
+docs:
+  # (empty at M1-001; M4-004 adds doc/postui-dmesg.pdxdoc)
+
+# --- Paideia-as compliance flags ---------------------------------------
+# Same invariant set postui / postui-top / shell / libpdx-* satellites
+# observe. A build under a non-conforming paideia-as revision refuses
+# fast in tools/build.sh's version-floor check.
+compliance:
+  - module-basename-pascal        # module <BasenamePascalCase>, no dir prefix
+  - no-test-mnemonic              # zero-check via cmp reg, 0
+  - cmp-imm32-only                # cmp reg, imm <= 0x7FFFFFFF; else stage via r11
+  - r11-scratch                   # r11 is not preserved across calls
+  - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
+  - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
+
+# --- Release policy (M4-004+) ------------------------------------------
+# Dual-signed release mirroring postui / postui-top / shell shape.
+# Populated at M4 closing; fields below are forward-declared so the
+# M4-004 landing does not need to introduce them.
+release:
+  signer_author: snunez+postui-dmesg-author@paideia-os.dev
+  signer_root:   paideia-os-release-root@paideia-os.dev
+  mldsa_level:   65
+  ed25519:       required
+  mirror_target: pkgs.paideia-os
+  tarball:       postui-dmesg-v1.0.0.tar.gz
+  manifest_kind: satellite-tool

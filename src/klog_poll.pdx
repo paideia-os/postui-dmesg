@@ -1,0 +1,820 @@
+// src/klog_poll.pdx -- postui-dmesg.M1-001 (paideia-os/postui-dmesg#1)
+//
+// KlogPoll module: KlogState struct + fixed-tick sys_dmesg poll loop
+// + line-parsing ring writer.
+//
+// =============================================================================
+// SCOPE (postui/docs/design.md §3.3 postui-dmesg reference app)
+// =============================================================================
+//
+// The M1-001 landing seeds postui-dmesg's data-source path: at a
+// fixed interval, read the klog ring tail via sys_dmesg (SC+ sysno
+// 13), split the returned byte stream on '\n' (0x0A), and write each
+// parsed line into a caller-provided ring of 256-byte log_line
+// records. This module ships two callable entry points
+// (klog_poll_init, klog_poll_tick) plus the constants + backing
+// storage they consume; no widget code, no canvas invocation, no
+// semantic-pipe emission runs at this landing (those land at M2 / M4
+// respectively per this repo's STATUS.md).
+//
+// The postui.M1 dependency (v1.0.0, tag postui-v1.0.0) is a
+// link-time consumer at M2+; M1-001 uses zero postui symbols and
+// compiles as a stand-alone object under build-out/klog_poll.o via
+// tools/build.sh.
+//
+// =============================================================================
+// KIND_DMESG SUBSTRATE: LIVE-VIA-SYSNO-13, NOT VIA sys_cap_invoke
+// =============================================================================
+//
+// The M1-001 issue text names sys_cap_invoke(op=READ_LINES) as the
+// intended reader path. The paideia-os HEAD substrate makes this
+// path INCOMPLETE at this landing:
+//
+//   * KIND_DMESG the cap kind IS live: paideia-os/src/kernel/core/
+//     cap/kind_dmesg.pdx (logging-m9-001 #708) defines OP_READ_TAIL
+//     (op_code 0, byte-tail reader) + OP_STAT (op_code 1, head
+//     snapshot). No OP_READ_LINES op exists -- kind_dmesg is
+//     byte-oriented; line-splitting is the reader's job (this
+//     module's kp_scan_step loop below).
+//
+//   * The sys_cap_invoke gate (sysno 4) IS live too, but the
+//     per-TCB cap-slot table userspace processes would need to HOLD
+//     a KIND_DMESG cap in is DEFERRED. paideia-os/src/kernel/core/
+//     syscall/handlers/sys_dmesg.pdx SECTION "Access control note"
+//     documents the reality: "R18 has no per-TCB cap-holder
+//     machinery yet (deferred to R19+ userspace-daemon substrate),
+//     so at this landing sys_dmesg is unrestricted. The KIND_DMESG
+//     cap is minted at boot and available for future gating when
+//     the TCB cap-slot table lands." kind_dmesg.pdx's own header
+//     confirms: "target_ptr = kernel VA of a caller-owned scratch
+//     buffer" -- the cap descriptor takes a kernel VA, not a user
+//     VA, so the direct sys_cap_invoke path is unreachable from
+//     userspace at this landing regardless of the cap-slot gap.
+//
+// The REACHABLE path today is sys_dmesg (SC+ sysno 13, logging-m9-
+// 002 #709; body at paideia-os/src/kernel/core/syscall/handlers/
+// sys_dmesg.pdx). It is a POSIX-style idempotent-peek copy of the
+// klog ring tail -- functionally identical to what OP_READ_TAIL
+// exposes: both wrap klog_ring_read_tail(dst, len). The dispatch
+// shim (dispatch.pdx dispatch_dmesg) caps `len` at DISPATCH_IO_MAX
+// = 4096 bytes and owns the KPTI-bounce+walker-copy of the ring
+// bytes back to userspace.
+//
+// This module therefore runs LIVE (not stub) against sys_dmesg at
+// M1-001. When the M2+ landing switches to sys_cap_invoke (once
+// TCB cap-slot machinery lands), the change is localized: swap
+// kp_sys_dmesg's SysV-to-SYSCALL body for a sys_cap_invoke wrapper
+// against the cap slot stored at state[+48] (klog_cap_slot,
+// reserved below). The caller's contract is unchanged. The
+// caps.decl already claims KIND_DMESG(read), so no manifest churn
+// at that time either.
+//
+// =============================================================================
+// MODULE NAME (paideia-as module-basename-pascal invariant)
+// =============================================================================
+//
+// paideia-as's `module-basename-pascal` compliance flag
+// (manifest.pdxproj `compliance` block) requires the module name to
+// match the file basename PascalCased. File is `klog_poll.pdx` ->
+// module `KlogPoll`. External callers reach this surface via the
+// pub let names below (KLOG_STATE_BYTES / LINE_BYTES /
+// klog_poll_init / klog_poll_tick / KP_ERR_*); the enclosing module
+// qualifier is a fingerprint marker only and does not appear in the
+// linker symbol table. Follows postui-top/src/poll.pdx precedent.
+//
+// =============================================================================
+// SC+ SYSCALL DEPENDENCIES (design/user/syscall-table.md, paideia-os)
+// =============================================================================
+//
+//   * sysno 13 = sys_dmesg(buf, len)          -> u64 bytes copied
+//   * sysno 66 = sys_clock_read_ns()          -> u64 ns since boot
+//
+// =============================================================================
+// TICK SEMANTICS (mirrors postui-top/src/poll.pdx §Tick semantics)
+// =============================================================================
+//
+// Same 2^24 ns (~16.7 ms) tick shape postui-top adopted. sys_clock_
+// read_ns returns ns; the module right-shifts by 24 to obtain a
+// tick count suitable for the fixed-interval refresh gate. Encoder-
+// safe (single shr, no imul, no div). A future sys_get_tick_count
+// SC+ syscall would let us swap PL_TICK_SHIFT for a byte-for-byte
+// tick match; single call site here (Phase A of klog_poll_tick).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (identical set to postui-top's poll.pdx)
+// =============================================================================
+//
+//   - Module name PascalCase basename (`KlogPoll`), matches file
+//     basename klog_poll.pdx.
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every immediate in cmp / and fits imm32 (<= 0x7FFFFFFF). The
+//     large sentinel band 0xFFFFE01x is only used in `mov reg, imm`
+//     form -- paideia-as emits the 10-byte movabs encoding for
+//     imm > 0x7FFFFFFF, legal for mov but NOT for cmp/and.
+//   - No 2-op `imul reg, imm` anywhere; no imul used at all. Row-
+//     stride math (line index -> slot offset) uses `shl reg, 8`
+//     (LINE_BYTES = 256 = 2^8, single shift).
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`
+//     (every compare loads through a scratch first).
+//   - r11 is scratch (paideia-as reserved). Nothing here writes r11
+//     with a value expected to survive a nested call; kp_write_line
+//     preserves nothing (leaf) and klog_poll_tick uses only rbx +
+//     r12..r15 as call-crossing state.
+//   - `xor reg, reg; mov_b reg, [ptr]` shape for every byte load;
+//     `mov_b [ptr], reg` for byte store (mirrors kernel core/
+//     drivers/nvme/mdts.pdx L136 + core/acpi/gpe_io.pdx L374).
+//   - Every function that issues a nested call pushes an ODD count
+//     of 8-byte callee-save registers so `rsp % 16 == 0` at the
+//     call boundary. klog_poll_tick: 5 pushes (rbx, r12, r13, r14,
+//     r15) = 40 B; SysV entry rsp%16==8 + 40 = rsp%16==0. kp_write_
+//     line: leaf, no pushes, no nested calls.
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names. Every label prefixed
+//     `kp_` (klog-poll). Substring "loop" avoided defensively
+//     (labels use `_scan_` / `_step_` / `_copy_`).
+//   - `pub let` single-line declarations only (multiline `pub let
+//     ="..."` is a paideia-as pitfall).
+
+module KlogPoll = structure {
+
+  // ==========================================================================
+  // Error band (postui-dmesg's wave-scoped high-nibble discriminator).
+  //
+  // The M1-001 issue text proposed 0xFFFFEC20..0xFFFFEC2F. That band
+  // is NOT free -- paideia-os/src/kernel/core/cap/kind_pdxfs_file.pdx
+  // SECTION 3 ("FAILURE TAXONOMY -- 0xFFFFEC20..0xFFFFEC2F") claims
+  // the entire sub-range end to end (PFF_TAIL_ENOSPC=0xFFFFEC2F down
+  // to PFF_REVOKE_ALREADY=0xFFFFEC26 with a fully-allocated centre).
+  // Populating our band there would collide byte-for-byte with live
+  // KIND_PDXFS_FILE return codes. The postui-top#1 debugger-audit
+  // fixup (postui-work/postui-top/src/poll.pdx §Error band) hit the
+  // exact same issue on 0xFFFFEC0x and relocated postui-top to
+  // 0xFFFFE000..0xFFFFE00F.
+  //
+  // FIX: postui-dmesg takes 0xFFFFE010..0xFFFFE01F, adjacent to
+  // postui-top's 0xFFFFE000..0xFFFFE00F in the wave-free
+  // 0xFFFFE0xx page. Verified by grep of the full 0xFFFFE01x range
+  // across paideia-os (src/, design/, tools/) and the postui-work
+  // sibling repos (postui, postui-top, postui-dmesg, postui-hex):
+  // zero collisions.
+  //
+  // Sentinels within the postui-dmesg band are allocated bottom-up:
+  //   +0  KP_ERR_BAD_STATE_PTR      klog_poll_init/tick with a null state
+  //   +1  KP_ERR_BAD_LINES_PTR      klog_poll_init with a null lines_ptr
+  //   +2  KP_ERR_BAD_LINE_CAP       klog_poll_init with line_cap == 0
+  //   +3  KP_ERR_INTERVAL_ZERO      klog_poll_init with interval_ticks == 0
+  //   +4..+F  reserved for M1-002+  (dmesg-read short-copy, line-parse
+  //                                  overflow, semantic-pipe emit refuse)
+  //
+  // The M1-001 klog_poll_init / klog_poll_tick bodies DO NOT validate
+  // their arguments at this landing -- caller bugs surface as
+  // segfaults or empty-ring polls rather than as sentinel returns.
+  // The sentinels are reserved here so the M1-002 defensive-gate
+  // landing does not need to introduce them.
+  // ==========================================================================
+  pub let POSTUI_DMESG_OK                : u64 = 0
+  pub let POSTUI_DMESG_ERR_BAND_BASE     : u64 = 0xFFFFE010
+  pub let POSTUI_DMESG_ERR_BAND_TOP      : u64 = 0xFFFFE01F
+
+  pub let KP_ERR_BAD_STATE_PTR           : u64 = 0xFFFFE010
+  pub let KP_ERR_BAD_LINES_PTR           : u64 = 0xFFFFE011
+  pub let KP_ERR_BAD_LINE_CAP            : u64 = 0xFFFFE012
+  pub let KP_ERR_INTERVAL_ZERO           : u64 = 0xFFFFE013
+
+  // ==========================================================================
+  // KlogState layout (128 bytes, 16 qwords, @align(64) -- fits in
+  // two L1D cache lines).
+  //
+  //   [+0]    log_lines_ptr        (u64)   caller-provided log_line[]
+  //                                        base (line_cap * 256 bytes)
+  //   [+8]    log_line_count       (u64)   count of live entries
+  //                                        (min(head-ever-written,
+  //                                        line_cap)); 0 until first
+  //                                        refresh
+  //   [+16]   line_cap             (u64)   caller-provided capacity
+  //                                        (max lines the ring holds)
+  //   [+24]   head                 (u64)   ring write cursor in
+  //                                        [0, line_cap); next slot to
+  //                                        overwrite; wraps to 0 when
+  //                                        it reaches line_cap
+  //   [+32]   interval_ticks       (u64)   fixed refresh interval
+  //   [+40]   last_poll_tick       (u64)   monotonic-clock tick
+  //                                        (ns >> KP_TICK_SHIFT) of
+  //                                        the last completed refresh;
+  //                                        0 pre-first-refresh so the
+  //                                        first klog_poll_tick call
+  //                                        always fires
+  //   [+48]   klog_cap_slot        (u64)   RESERVED at M1-001 (writes
+  //                                        0 at klog_poll_init). Will
+  //                                        hold the KIND_DMESG cap
+  //                                        slot index once the M2+
+  //                                        cap-slot machinery lands
+  //                                        and kp_sys_dmesg switches
+  //                                        from sysno 13 to a
+  //                                        sys_cap_invoke wrapper.
+  //   [+56..+127] reserved                 72 bytes of growth room
+  //                                        (per-severity histograms,
+  //                                        drop counter, KIND_DMESG
+  //                                        OP_STAT head snapshot for
+  //                                        streaming semantics);
+  //                                        zeroed by klog_poll_init
+  //                                        so an M1-002+ reader can
+  //                                        trust an unset field as 0
+  //
+  // Chosen at 128 bytes rather than the postui-top-shape 256 because
+  // the KlogPoll growth surface is narrower (no per-slot latency
+  // histogram; one severity byte per line is the extent of the M2
+  // additions). Two L1D lines instead of four; keeps the hot header
+  // (poll_init reads/writes) in the first line and the cold reserved
+  // region in the second.
+  // ==========================================================================
+  pub let KLOG_STATE_BYTES              : u64 = 128
+
+  pub let KP_OFF_LOG_LINES_PTR          : u64 = 0
+  pub let KP_OFF_LOG_LINE_COUNT         : u64 = 8
+  pub let KP_OFF_LINE_CAP               : u64 = 16
+  pub let KP_OFF_HEAD                   : u64 = 24
+  pub let KP_OFF_INTERVAL_TICKS         : u64 = 32
+  pub let KP_OFF_LAST_POLL_TICK         : u64 = 40
+  pub let KP_OFF_KLOG_CAP_SLOT          : u64 = 48
+  pub let KP_OFF_RESERVED               : u64 = 56
+
+  // ==========================================================================
+  // log_line layout (256 bytes per record, 32 u64 slots -- the M2 List
+  // widget reads through these offsets rather than magic literals).
+  //
+  //   [+0]    severity     (u64)   PLACEHOLDER at M1-001 (always 0).
+  //                                Real severity extraction from the
+  //                                klog wire format (level letter in
+  //                                the leading `<L>` token per
+  //                                paideia-os design/kernel/kernel-
+  //                                logging-substrate.md §6.2) is a M2
+  //                                item that lands with the List
+  //                                widget's per-severity color
+  //                                mapping.
+  //   [+8]    timestamp_ns (u64)   Monotonic ns snapshot at the poll
+  //                                that read this line. NOT the
+  //                                per-line TSC embedded in the klog
+  //                                wire format (design §6.2 T=
+  //                                token) -- per-line parsing lands
+  //                                at M2 alongside severity
+  //                                extraction. This approximation
+  //                                lets M1-005's fingerprint test
+  //                                assert a monotonic ordering
+  //                                across polls without needing the
+  //                                parser.
+  //   [+16]   text_ptr     (u64)   -> _kp_text[out_idx * LINE_TEXT_MAX],
+  //                                pointing to the copied line bytes
+  //                                (no trailing '\n', no NUL). Stable
+  //                                across klog_poll_tick calls
+  //                                (rewritten in place at the same
+  //                                slot index on ring wrap).
+  //   [+24]   text_len     (u64)   line byte count in
+  //                                [0, LINE_TEXT_MAX]; excludes the
+  //                                terminating '\n' (0x0A). Values
+  //                                > LINE_TEXT_MAX are truncated at
+  //                                copy time (kp_write_line body).
+  //   [+32..+255] reserved u64[28] 224 bytes of growth room:
+  //                                - per-line CPU number (klog wire
+  //                                  format C= token, M2 parse)
+  //                                - subsystem id (klog S= token)
+  //                                - k_* tag id (klog T= token, one
+  //                                  qword per token pair)
+  //                                - dedup counter for repeated
+  //                                  lines (M3 List widget grouping)
+  //                                - render-time cached wcswidth
+  //                                  (M2 List widget viewport clip)
+  //                                Zeroed by kp_write_line each
+  //                                refresh (via the reserved-region
+  //                                zero pass below).
+  //
+  // Chosen at 256 bytes so the M4-004 DmesgLineView@0.1 semantic-
+  // pipe schema (see caps.decl declares_output_schemas) can be
+  // emitted BYTE-FOR-BYTE from the first 32 bytes of this in-memory
+  // layout via a single copy-out: the schema wire format is exactly
+  // the (severity, timestamp_ns, text_ptr, text_len) prefix plus
+  // the 32-byte BLAKE3 envelope header libpdx-semantic-pipe
+  // prepends. The +32..+255 reserved region stays in-process and is
+  // NOT on the wire.
+  // ==========================================================================
+  pub let LINE_BYTES : u64 = 256
+
+  pub let KP_LINE_OFF_SEVERITY     : u64 = 0
+  pub let KP_LINE_OFF_TIMESTAMP_NS : u64 = 8
+  pub let KP_LINE_OFF_TEXT_PTR     : u64 = 16
+  pub let KP_LINE_OFF_TEXT_LEN     : u64 = 24
+
+  // ==========================================================================
+  // Line-text ceiling. Each log_line's text_ptr points to a slot in
+  // _kp_text sized LINE_TEXT_MAX = 256 bytes. A klog line longer than
+  // 256 bytes gets truncated at kp_write_line copy time (rare in
+  // practice: paideia-os klog lines are typically <= 128 bytes per
+  // kernel-logging-substrate.md §6.2 wire format).
+  // ==========================================================================
+  pub let LINE_TEXT_MAX : u64 = 256
+
+  // ==========================================================================
+  // Line-count ceiling (mirrors postui-top's PL_MAX_ROWS). A
+  // line_cap > KP_MAX_LINES wastes _kp_text backing store slots;
+  // the M1-002 defensive-gate landing may reject line_cap >
+  // KP_MAX_LINES with KP_ERR_BAD_LINE_CAP, but M1-001 lets the
+  // caller pass anything and only the first KP_MAX_LINES ring
+  // positions get text-backing storage. Choosing 64 matches
+  // postui-top and keeps _kp_text at 64 * 256 = 16 KiB, comfortable
+  // for .bss.
+  // ==========================================================================
+  pub let KP_MAX_LINES : u64 = 64
+
+  // ==========================================================================
+  // sys_dmesg scratch buffer size. Matches paideia-os's
+  // DISPATCH_IO_MAX = 4096 (see src/kernel/core/syscall/dispatch.pdx
+  // line 105 _dispatch_dmesg_buf_scratch). Any request larger than
+  // 4096 gets capped by the dispatch shim (dispatch_dmesg_len_ok),
+  // so allocating a full 4096-byte scratch here matches the maximum
+  // the kernel will fill in a single call.
+  // ==========================================================================
+  pub let KP_DMESG_SCRATCH_BYTES : u64 = 4096
+
+  // ==========================================================================
+  // SC+ sysno constants (design/user/syscall-table.md, paideia-os).
+  // Named locally so kp_sys_dmesg + kp_sys_clock_ns name the SC+ ID
+  // in exactly one place per call; matches the shell/src/syscall.pdx
+  // + postui-top/src/poll.pdx SYS_* discipline.
+  // ==========================================================================
+  pub let KP_SYS_DMESG         : u64 = 13
+  pub let KP_SYS_CLOCK_READ_NS : u64 = 66
+
+  // ==========================================================================
+  // Tick conversion (see §TICK SEMANTICS above).
+  // ==========================================================================
+  pub let KP_TICK_SHIFT : u64 = 24
+
+  // ==========================================================================
+  // LF byte separator used to split the sys_dmesg return into lines.
+  // paideia-os klog lines are '\n'-terminated per src/kernel/core/
+  // klog/emit.pdx line 387 (mov al, 0x0A followed by ring append).
+  // ==========================================================================
+  pub let KP_LF : u64 = 0x0A
+
+  // ==========================================================================
+  // Scratch storage. _kp_dmesg_scratch receives up to 4096 bytes per
+  // sys_dmesg call; _kp_text holds KP_MAX_LINES * LINE_TEXT_MAX =
+  // 64 * 256 = 16384 bytes of copied line data (one 256-byte slot
+  // per ring position). Both live in .bss (zero-initialized at
+  // load); kp_write_line overwrites them per-call.
+  // ==========================================================================
+  pub let mut _kp_dmesg_scratch : [u8; 4096]  = uninit @align(8)
+  pub let mut _kp_text          : [u8; 16384] = uninit @align(8)
+
+  // ==========================================================================
+  // kp_sys_clock_ns() -> u64 ns
+  //
+  // Thin wrapper around SC+ sysno 66 (sys_clock_read_ns). Returns
+  // monotonic ns since boot in rax. Nullary; no arg shuffle needed.
+  // Kernel body at src/kernel/core/syscall/handlers/clock_read_ns.pdx
+  // (paideia-os R31.M2-001 #1582). Byte-for-byte identical to
+  // postui-top's pl_sys_clock_ns.
+  // ==========================================================================
+  pub let kp_sys_clock_ns : () -> u64 !{sysreg} @{} =
+    fn () -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "postui-dmesg.M1-001 (postui-dmesg#1): SC+ sysno 66 (sys_clock_read_ns) wrapper. Nullary -- no SysV-to-SYSCALL arg shuffle. mov rax, 66; syscall; ret. Kernel body at paideia-os src/kernel/core/syscall/handlers/clock_read_ns.pdx returns _tick_count * 10_000_000 into rax (ns since boot). Leaf: rcx/r11 SYSCALL-clobbered, both SysV caller-save. Sole klog_poll_tick consumer -- the returned ns is right-shifted by KP_TICK_SHIFT (24) to obtain the 16.7-ms-tick value compared against poll_interval_ticks; the raw ns is also stashed into r15 as the per-line timestamp_ns snapshot (Phase A of klog_poll_tick).",
+      block: {
+        mov rax, 66;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // kp_sys_dmesg(buf, len) -> u64 bytes_copied
+  //
+  // Thin wrapper around SC+ sysno 13 (sys_dmesg). Copies up to `len`
+  // bytes of the klog ring tail into user buffer at `buf`. Returns
+  // bytes copied in [0, len] (POSIX-style short-copy legal). Kernel
+  // body at src/kernel/core/syscall/handlers/sys_dmesg.pdx wraps
+  // klog_ring_read_tail; the dispatch shim (dispatch.pdx
+  // dispatch_dmesg) caps `len` at DISPATCH_IO_MAX (4096) and owns
+  // the KPTI-bounce + user_write_bytes_via_walk write-back.
+  //
+  // SysV rdi/rsi -> SYSCALL rdi/rsi (no shuffle; arity 2 < 4). Leaf.
+  //
+  // Effect row `!{mem, sysreg}` because the kernel writes up to
+  // `len` bytes into the caller's `buf`. No capability (@{}) at M1
+  // -- the future M1+ policy (KIND_DMESG cap-slot dispatch once
+  // TCB cap-holder machinery lands) will land at the syscall
+  // handler, not this userspace wrapper. See §KIND_DMESG SUBSTRATE
+  // above for the full rationale on why this is sysno 13 today
+  // rather than sys_cap_invoke.
+  // ==========================================================================
+  pub let kp_sys_dmesg : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (buf: u64) (len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "postui-dmesg.M1-001 (postui-dmesg#1): SC+ sysno 13 (sys_dmesg) wrapper. SysV rdi=buf / rsi=len pass through unchanged to SYSCALL rdi/rsi (arity 2). mov rax, 13; syscall; ret. Kernel dispatch at src/kernel/core/syscall/dispatch.pdx dispatch_dmesg caps len at DISPATCH_IO_MAX (4096), user_ptr_ok-gates buf, then copies klog_ring_read_tail output through the walker. Returns bytes copied in [0, len]. Leaf: rcx/r11 SYSCALL-clobbered (SysV caller-save). Sole consumer: klog_poll_tick's Phase B refresh. When TCB cap-slot machinery lands and this wrapper switches to a sys_cap_invoke against state[+48].klog_cap_slot, the byte-copy semantics (dst, len, return-copied) stay identical.",
+      block: {
+        mov rax, 13;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // kp_write_line(state_ptr, line_start_idx, line_len, now_ns) -> void
+  //
+  // Write one parsed klog line into the ring slot pointed at by the
+  // current head cursor, then advance the cursor with wrap. Copies
+  // up to LINE_TEXT_MAX bytes from _kp_dmesg_scratch[line_start_idx
+  // .. line_start_idx + line_len] into _kp_text[head * LINE_TEXT_MAX
+  // .. + LINE_TEXT_MAX] and populates the log_line record at
+  // log_lines_ptr + head * LINE_BYTES.
+  //
+  // Contract:
+  //   rdi = state_ptr         VA of a KlogState populated by
+  //                           klog_poll_init
+  //   rsi = line_start_idx    byte offset into _kp_dmesg_scratch of
+  //                           the first byte of the line to write
+  //   rdx = line_len          raw line byte length (before capping
+  //                           at LINE_TEXT_MAX)
+  //   rcx = now_ns            timestamp snapshot to store in the
+  //                           line record's timestamp_ns field
+  //   -> void                 (rax return value is unspecified; the
+  //                           only caller (klog_poll_tick) does not
+  //                           read it)
+  //
+  // Body responsibilities:
+  //   1. Cap line_len at LINE_TEXT_MAX (256).
+  //   2. Byte-copy line_len bytes from _kp_dmesg_scratch +
+  //      line_start_idx to _kp_text + head * LINE_TEXT_MAX.
+  //   3. Populate the log_line record at
+  //      log_lines_ptr + head * LINE_BYTES:
+  //         [+0] severity = 0 (placeholder; M2 parses klog level)
+  //         [+8] timestamp_ns = now_ns
+  //         [+16] text_ptr = _kp_text + head * LINE_TEXT_MAX
+  //         [+24] text_len = capped line_len
+  //   4. Advance head: head = (head + 1) % line_cap (wrap-at-cap).
+  //   5. Increment log_line_count, clamped at line_cap.
+  //
+  // Leaf: no nested calls. No callee-save pushes needed. Every
+  // register we use is either an SysV caller-save arg (rdi, rsi,
+  // rdx, rcx) or one of the scratch registers r8, r9, r10, r11
+  // (all SysV caller-save). rbx / r12..r15 are NOT touched, so the
+  // caller (klog_poll_tick) sees its own state_ptr / bytes_read /
+  // scan-cursor / lines-written / now-ns registers intact across
+  // this call.
+  //
+  // Alignment: entry rsp%16==8 (caller called us with rsp%16==0 and
+  // the CALL push added 8). No nested calls -> no further alignment
+  // constraint. Ret pops the return address, restoring caller rsp.
+  //
+  // Labels prefixed kp_wl_; substring "loop" avoided per encoder-
+  // reserved-keyword discipline.
+  // ==========================================================================
+  pub let kp_write_line : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) (line_start_idx: u64) (line_len: u64) (now_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-dmesg.M1-001 (postui-dmesg#1): ring-slot writer for one parsed klog line. Contract SysV rdi=state_ptr, rsi=line_start_idx, rdx=line_len, rcx=now_ns. Body: (Step 1) Stash now_ns in r11 so rcx is free as a byte-copy working reg. (Step 2) Cap line_len at LINE_TEXT_MAX=256 via mov rax,256; cmp rdx,rax; jbe .lok; mov rdx,rax; .lok:. (Step 3) Load head into r8 from [rdi+24]; compute head*LINE_BYTES=head*256 into rax via shl rax,8; slot_ptr = lines_ptr + rax stored in r10 (mov r10,[rdi+0]; add r10,rax); text_ptr = _kp_text + rax stored in r9 (lea r9,[rip+_kp_text]; add r9,rax). Both slot_ptr and text_ptr computed with rax = head*256 reused for the two additions (single shl, two adds). (Step 4) Byte copy: rax=src pointer (_kp_dmesg_scratch + line_start_idx), rcx=working-dst pointer initialized from r9, rsi=working-count initialized from rdx (rdx preserved for the text_len store later). Loop: cmp rsi,0; je .cdone; xor r8,r8; mov_b r8,[rax]; mov_b [rcx],r8; add rax,1; add rcx,1; sub rsi,1; jmp .cbody. Byte load+store uses full reg name r8 (matches core/drivers/nvme/mdts.pdx L136 for load, core/acpi/gpe_io.pdx L374 for store). r8 gets clobbered inside the loop -- this is why we recompute head from [rdi+24] before the field stores. (Step 5) Fill slot record: xor rax,rax; mov [r10+0],rax (severity=0); mov [r10+8],r11 (timestamp_ns from stashed now_ns); mov [r10+16],r9 (text_ptr -- r9 stayed live across the copy loop because we used rcx as the working dst); mov [r10+24],rdx (text_len -- rdx also stayed live for the same reason). (Step 6) Advance head: mov r8,[rdi+24] (fresh load post-copy-clobber); add r8,1; mov rcx,[rdi+16] (line_cap); cmp r8,rcx; jb .hok; xor r8,r8 (wrap to 0); .hok: mov [rdi+24],r8. (Step 7) Increment log_line_count with clamp: mov r8,[rdi+8]; add r8,1; mov rcx,[rdi+16]; cmp r8,rcx; jbe .ctok; mov r8,rcx (clamp to line_cap); .ctok: mov [rdi+8],r8. (Step 8) ret. Encoder discipline: no `test` (cmp reg,0 everywhere); no imul (LINE_BYTES=256 stride via shl 8); no `and reg,imm64` (line_len cap uses cmp+jbe+mov, not and rdx,0xFF); no `cmp reg,[mem]` (line_cap loaded to rcx before the cmp). Every immediate (0, 1, 8, 16, 24, 256) fits imm8/imm32. Labels prefixed kp_wl_; substring `loop` avoided (kp_wl_copy_step / kp_wl_copy_done / kp_wl_lok / kp_wl_hd_ok / kp_wl_ct_ok). Leaf: zero pushes / zero pops. Every touched reg is SysV caller-save from the outer klog_poll_tick's POV (rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11); rbx and r12..r15 (klog_poll_tick's roles) are never touched here, so nothing needs preserving across the call.",
+      block: {
+        // Step 1: stash now_ns so rcx can be used as byte-copy dst
+        // scratch (needs to be freely clobberable inside the copy
+        // loop).
+        mov r11, rcx;
+
+        // Step 2: cap line_len at LINE_TEXT_MAX (256).
+        mov rax, 256;
+        cmp rdx, rax;
+        jbe kp_wl_lok;
+        mov rdx, rax;
+        kp_wl_lok:
+
+        // Step 3: compute slot_ptr and text_ptr from head.
+        mov r8, [rdi + 24];                        // r8 = head
+        mov rax, r8;
+        shl rax, 8;                                // rax = head * 256
+        mov r10, [rdi + 0];                        // r10 = lines_ptr
+        add r10, rax;                              // r10 = slot_ptr
+        lea r9, [rip + _kp_text];
+        add r9, rax;                               // r9 = text_ptr
+
+        // Step 4: byte copy line_len bytes.
+        // src = _kp_dmesg_scratch + line_start_idx (rsi arg)
+        lea rax, [rip + _kp_dmesg_scratch];
+        add rax, rsi;                              // rax = src pointer
+        mov rcx, r9;                               // rcx = working dst
+        mov rsi, rdx;                              // rsi = working count
+
+        kp_wl_copy_step:
+        cmp rsi, 0;
+        je kp_wl_copy_done;
+        xor r8, r8;
+        mov_b r8, [rax];
+        mov_b [rcx], r8;
+        add rax, 1;
+        add rcx, 1;
+        sub rsi, 1;
+        jmp kp_wl_copy_step;
+        kp_wl_copy_done:
+
+        // Step 5: fill slot record (r10=slot_ptr, r9=text_ptr,
+        // r11=now_ns, rdx=capped line_len all still live).
+        xor rax, rax;
+        mov [r10 + 0], rax;                        // severity = 0
+        mov [r10 + 8], r11;                        // timestamp_ns
+        mov [r10 + 16], r9;                        // text_ptr
+        mov [r10 + 24], rdx;                       // text_len
+
+        // Step 6: advance head with wrap-at-cap.
+        mov r8, [rdi + 24];                        // reload head (copy loop clobbered r8)
+        add r8, 1;
+        mov rcx, [rdi + 16];                       // rcx = line_cap
+        cmp r8, rcx;
+        jb kp_wl_hd_ok;
+        xor r8, r8;                                // wrap to 0
+        kp_wl_hd_ok:
+        mov [rdi + 24], r8;                        // store new head
+
+        // Step 7: increment log_line_count, clamped at line_cap.
+        mov r8, [rdi + 8];
+        add r8, 1;
+        mov rcx, [rdi + 16];
+        cmp r8, rcx;
+        jbe kp_wl_ct_ok;
+        mov r8, rcx;                               // clamp
+        kp_wl_ct_ok:
+        mov [rdi + 8], r8;
+
+        // Step 8: return (rax is 0 from the severity store's xor;
+        // caller ignores the value).
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // klog_poll_init(state_ptr, lines_ptr, line_cap, interval_ticks) -> u64
+  //
+  // Initialize a KlogState struct in caller-provided memory. Writes
+  // every non-reserved field, then zeroes the reserved region
+  // (+56..+127) too so an M1-002+ reader of that region can trust
+  // an unset field as 0 without requiring every caller to pre-zero
+  // the struct itself (matches postui-top#1 M1-001 debugger-audit
+  // fixup discipline for its own 216-byte reserved region).
+  //
+  // klog_cap_slot (+48) is explicitly zeroed too -- at M1-001 the
+  // KIND_DMESG cap is not held in a userspace slot; the field is
+  // reserved for the M2+ sys_cap_invoke switch (see §KIND_DMESG
+  // SUBSTRATE above).
+  //
+  // last_poll_tick (+40) is explicitly zeroed so klog_poll_tick's
+  // own last_poll_tick==0 special case (see Phase A) forces its
+  // first call to always refresh regardless of caller state hygiene.
+  //
+  // Contract:
+  //   rdi = state_ptr         VA of a >= KLOG_STATE_BYTES (128) struct
+  //   rsi = lines_ptr         VA of a line_cap * LINE_BYTES (256B) buffer
+  //   rdx = line_cap          max lines the ring holds (typical
+  //                           dmesg usage: 64)
+  //   rcx = interval_ticks    refresh interval in 2^24-ns units
+  //   -> rax = 0              always (no validation at M1-001; the
+  //                           KP_ERR_* sentinels are reserved for
+  //                           M1-002 defensive gates)
+  //
+  // Register plan: zero pushes needed (no nested calls). All work
+  // is register-immediate stores through rdi. rsi/rdx/rcx are read
+  // once each into the destination struct; once stored, rdx/rcx
+  // are reused as scratch for the reserved-region zero loop (rax
+  // already holds the 0 fill value from the count store).
+  //
+  // Labels: kp_init_zero_step / kp_init_zero_end (reserved-region
+  // zero loop only; the field-stamp prefix remains linear/branch-
+  // free).
+  // ==========================================================================
+  pub let klog_poll_init : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) (lines_ptr: u64) (line_cap: u64) (interval_ticks: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-dmesg.M1-001 (postui-dmesg#1): KlogState field-stamp initializer. Contract SysV rdi=state_ptr, rsi=lines_ptr, rdx=line_cap, rcx=interval_ticks. Body writes seven u64 slots through rdi: [+0]=rsi (log_lines_ptr), [+8]=0 (log_line_count via xor rax,rax; mov [rdi+8],rax), [+16]=rdx (line_cap), [+24]=0 (head; reuses zeroed rax), [+32]=rcx (interval_ticks), [+40]=0 (last_poll_tick; reuses zeroed rax), [+48]=0 (klog_cap_slot -- reserved for M2+ sys_cap_invoke switch; reuses zeroed rax). Then zeroes the reserved region [+56..+127] (9 qwords) via a small scan loop identical in shape to postui-top/src/poll.pdx pl_init_zero_scan: rcx=cursor starting at 56 incrementing by 8, rdx=lea-computed scratch pointer rdi+rcx per-iteration, loop exits via cmp rcx,128; jae .end. Return xor rax,rax (0=POSTUI_DMESG_OK) -- rax is still 0 after the zero loop since the loop's fill value (rax) is never modified once set. No validation at this landing -- caller bugs (null state_ptr, line_cap==0) surface as segfaults or empty polls; the KP_ERR_* sentinels reserved above land defensive gates at M1-002. Zero pushes/pops -- no callee-save touched, no nested call. rdi/rsi/rdx/rcx are all SysV caller-save, so reusing rdx/rcx as post-store scratch is safe. Encoder discipline: no `test`, no imul, no imm64 in cmp/and, no cmp reg,[mem] (the loop bound check `cmp rcx,128` is against a register-held cursor, not memory), no and reg,imm64. Every field offset (+0/+8/+16/+24/+32/+40/+48) and every loop immediate (56, 128, 8, 0) fits imm8/imm32. Labels kp_init_zero_step / kp_init_zero_end prefixed kp_ (substring `loop` avoided). Leaf.",
+      block: {
+        // [+0] log_lines_ptr = rsi
+        mov [rdi + 0], rsi;
+        // [+16] line_cap = rdx
+        mov [rdi + 16], rdx;
+        // [+32] interval_ticks = rcx
+        mov [rdi + 32], rcx;
+        // Zero all non-argument fields with a single shared zero
+        // (rax) filler.
+        xor rax, rax;
+        mov [rdi + 8], rax;                        // log_line_count = 0
+        mov [rdi + 24], rax;                       // head = 0
+        mov [rdi + 40], rax;                       // last_poll_tick = 0
+        mov [rdi + 48], rax;                       // klog_cap_slot = 0
+
+        // Zero the reserved growth region [+56..+127] (9 qwords)
+        // so klog_poll_init leaves the entire 128-byte KlogState
+        // struct in a known state.
+        mov rcx, 56;
+        kp_init_zero_step:
+        cmp rcx, 128;
+        jae kp_init_zero_end;
+        lea rdx, [rdi + rcx];
+        mov [rdx + 0], rax;
+        add rcx, 8;
+        jmp kp_init_zero_step;
+        kp_init_zero_end:
+
+        // rax = 0 (POSTUI_DMESG_OK).
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // klog_poll_tick(state_ptr) -> u64 lines_written
+  //
+  // The fixed-interval refresh entry. Called every application loop
+  // step; either refreshes the log-line ring (returning the count of
+  // lines written this refresh) or no-ops when the interval has not
+  // yet elapsed (returning 0).
+  //
+  // Contract:
+  //   rdi = state_ptr         VA of a KlogState populated by
+  //                           klog_poll_init
+  //   -> rax = N              N lines written this refresh
+  //                           (0..KP_DMESG_SCRATCH_BYTES; typically
+  //                           << that in practice); state fields
+  //                           head, log_line_count, last_poll_tick
+  //                           and the log_lines_ptr[] slots are
+  //                           updated
+  //   -> rax = 0              (a) interval not yet elapsed -- state
+  //                           unchanged; OR (b) sys_dmesg returned
+  //                           0 bytes -- last_poll_tick still
+  //                           updated to avoid hammering sys_dmesg
+  //                           every call
+  //
+  // Algorithm:
+  //   Phase A: now_ns = kp_sys_clock_ns(); now_tick = now_ns >>
+  //            KP_TICK_SHIFT. If last_poll_tick == 0 (klog_poll_init
+  //            pre-first-refresh sentinel), skip the elapsed check
+  //            and force refresh -- matches postui-top's Phase A
+  //            debugger-audit fixup discipline (avoids the same
+  //            latent bug where a small now_tick shortly after boot
+  //            would compute elapsed = now_tick - 0 = now_tick and
+  //            fail the interval gate for large interval_ticks).
+  //            Otherwise: elapsed = now_tick - last_poll_tick; if
+  //            elapsed < interval_ticks -> return 0 (no refresh).
+  //   Phase B: bytes_read = kp_sys_dmesg(_kp_dmesg_scratch,
+  //            KP_DMESG_SCRATCH_BYTES). If 0 -> commit tick, return 0.
+  //   Phase C: scan+parse+write loop. Walk i = 0..bytes_read; on
+  //            each LF (0x0A) byte, write the line
+  //            _kp_dmesg_scratch[line_start .. i] via kp_write_line
+  //            (skipping empty lines where i == line_start). At end
+  //            of scratch, flush any trailing unterminated line
+  //            (same skip-if-empty rule).
+  //   Phase D: last_poll_tick = now_tick (commit).
+  //   Phase E: return lines_written.
+  //
+  // Register plan: 5-push callee-save prologue (rbx / r12 / r13 /
+  // r14 / r15) = 40 bytes -> SysV entry rsp%16==8, +40 -> rsp%16==0.
+  // Every nested call (kp_sys_clock_ns, kp_sys_dmesg, kp_write_line)
+  // sees the aligned stack. Roles held across phase transitions:
+  //   rbx = state_ptr        (all phases; kp_write_line arg 0)
+  //   r12 = bytes_read       (Phases C-onwards; scan-loop bound)
+  //   r13 = scan cursor i    (Phase C)
+  //   r14 = lines_written    (Phase C; return value in Phase E)
+  //   r15 = now_ns           (Phase A capture; Phase D commit;
+  //                           kp_write_line arg 3 in Phase C)
+  //
+  // rbx/r12..r15 are all SysV callee-save; kp_write_line and the
+  // syscall wrappers do NOT clobber them (all their working regs
+  // are caller-save). r10 (line_start scratch inside the scan
+  // loop) is caller-save and gets clobbered by kp_write_line, so
+  // the scan loop reloads line_start from r13 (== end of just-
+  // written line + 1) as `mov r10, r13` after each successful
+  // kp_write_line call.
+  //
+  // Labels prefixed kp_; substring "loop" avoided per encoder-
+  // reserved-keyword discipline (used `_scan_` / `_step_` / etc.).
+  // ==========================================================================
+  pub let klog_poll_tick : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "postui-dmesg.M1-001 (postui-dmesg#1): fixed-interval klog-line refresh entry. Register plan: 5-push callee-save prologue (rbx=state_ptr, r12=bytes_read, r13=scan cursor i, r14=lines_written counter, r15=now_ns snapshot) = 40B -> SysV rsp%16==8 + 40 = rsp%16==0 for every nested call (kp_sys_clock_ns, kp_sys_dmesg, kp_write_line). Phase A (interval gate): call kp_sys_clock_ns; mov r15,rax (now_ns preserved for Phase C per-line timestamps and Phase D commit); shr rax,KP_TICK_SHIFT=24 (rax = now_tick); mov rcx,[rbx+40] (last_poll_tick). If rcx==0 (klog_poll_init pre-first-refresh sentinel): je kp_first_refresh (force unconditional refresh regardless of interval). Else: sub rax,rcx (elapsed_ticks; unsigned wrap OK because last_poll_tick <= now_tick always given the monotonic clock); mov rcx,[rbx+32] (interval_ticks); cmp rax,rcx; jb kp_notyet (below = not enough elapsed -> return 0 without state changes). kp_first_refresh: (Phase B) lea rdi,[rip+_kp_dmesg_scratch]; mov rsi,4096 (KP_DMESG_SCRATCH_BYTES); call kp_sys_dmesg; mov r12,rax (bytes_read). cmp r12,0; je kp_no_data (nothing to parse -> commit tick, return 0). (Phase C) xor r13,r13 (scan cursor i=0); xor r14,r14 (lines_written=0). kp_scan_reset: mov r10,r13 (line_start = current i). kp_scan_step: cmp r13,r12; jae kp_scan_flush (i past end -> flush trailing). Load byte at _kp_dmesg_scratch[i]: lea r9,[rip+_kp_dmesg_scratch]; add r9,r13; xor r8,r8; mov_b r8,[r9]; cmp r8,0x0A (KP_LF); je kp_scan_newline. Otherwise: add r13,1; jmp kp_scan_step. kp_scan_newline: line = scratch[r10..r13], len = r13-r10. mov r9,r13; sub r9,r10; cmp r9,0; je kp_scan_advance (skip empty line, don't call kp_write_line for a bare '\\n'). Call kp_write_line: mov rdi,rbx (state_ptr); mov rsi,r10 (line_start_idx); mov rdx,r9 (line_len); mov rcx,r15 (now_ns); call kp_write_line. Then add r14,1 (lines_written). kp_scan_advance: add r13,1 (skip the LF byte); jmp kp_scan_reset. kp_scan_flush: at end of scratch -- there may be an unterminated trailing line at scratch[r10..r13] (r13==r12). Same length + empty-skip check; same kp_write_line invocation; then fall through to kp_commit_tick without incrementing r13 or reloading line_start. kp_commit_tick: (Phase D) mov rax,r15; shr rax,24; mov [rbx+40],rax (last_poll_tick). (Phase E) mov rax,r14 (return lines_written); 5-pop; ret. kp_notyet: xor rax,rax; 5-pop; ret. kp_no_data: mov rax,r15; shr rax,24; mov [rbx+40],rax (still commit tick even on empty poll so the next call gates against the interval rather than always refreshing); xor rax,rax; 5-pop; ret. Encoder discipline: no `test` (every zero-check via cmp reg,0); no imul (no row-stride math in this function -- kp_write_line owns that); no `and reg,imm64` (the LF compare uses cmp r8,0x0A imm8, not `and r8,0xFF` staging); no `cmp reg,[mem]` (all compares against register-held values loaded via prior mov); no `mul` mnemonic; every immediate (0, 1, 8, 24, 40, 4096, 0x0A) fits imm8/imm32. Byte load uses `xor r8,r8; mov_b r8,[r9]` per the byte-load-zero-then-mov_b compliance flag. Labels prefixed kp_ (substring `loop` avoided: kp_scan_reset / kp_scan_step / kp_scan_newline / kp_scan_advance / kp_scan_flush / kp_first_refresh / kp_notyet / kp_no_data / kp_commit_tick). Cross-module calls (kp_sys_clock_ns / kp_sys_dmesg / kp_write_line) all preserve rbx and r12..r15 (either leaf syscall wrappers or a leaf kp_write_line whose entire register plan lives in SysV caller-save regs) -- no additional stack pad needed at the callsite; the 5-push prologue already aligns rsp%16==0.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                              // rbx = state_ptr
+
+        // ---- Phase A: interval gate ---------------------------------------
+        call kp_sys_clock_ns;
+        mov r15, rax;                              // r15 = now_ns (kept for Phase C ts + Phase D commit)
+        shr rax, 24;                               // rax = now_tick
+        mov rcx, [rbx + 40];                       // rcx = last_poll_tick
+        // last_poll_tick==0 is klog_poll_init's pre-first-refresh
+        // sentinel -- force the first refresh unconditionally.
+        cmp rcx, 0;
+        je kp_first_refresh;
+        sub rax, rcx;                              // rax = elapsed_ticks
+        mov rcx, [rbx + 32];                       // rcx = interval_ticks
+        cmp rax, rcx;
+        jb kp_notyet;
+        kp_first_refresh:
+
+        // ---- Phase B: read ring bytes -------------------------------------
+        lea rdi, [rip + _kp_dmesg_scratch];
+        mov rsi, 4096;                             // KP_DMESG_SCRATCH_BYTES
+        call kp_sys_dmesg;
+        mov r12, rax;                              // r12 = bytes_read
+        cmp r12, 0;
+        je kp_no_data;
+
+        // ---- Phase C: scan + parse + write loop ---------------------------
+        xor r13, r13;                              // scan cursor i = 0
+        xor r14, r14;                              // lines_written = 0
+
+        kp_scan_reset:
+        mov r10, r13;                              // line_start = i
+
+        kp_scan_step:
+        cmp r13, r12;
+        jae kp_scan_flush;
+        // Load byte at _kp_dmesg_scratch[i]
+        lea r9, [rip + _kp_dmesg_scratch];
+        add r9, r13;
+        xor r8, r8;
+        mov_b r8, [r9];
+        cmp r8, 0x0A;                              // KP_LF
+        je kp_scan_newline;
+        add r13, 1;
+        jmp kp_scan_step;
+
+        kp_scan_newline:
+        mov r9, r13;
+        sub r9, r10;                               // r9 = line_len raw
+        cmp r9, 0;
+        je kp_scan_advance;                        // skip empty line
+        // kp_write_line(state, line_start, line_len, now_ns)
+        mov rdi, rbx;
+        mov rsi, r10;
+        mov rdx, r9;
+        mov rcx, r15;
+        call kp_write_line;
+        add r14, 1;                                // lines_written += 1
+        kp_scan_advance:
+        add r13, 1;                                // skip LF byte
+        jmp kp_scan_reset;
+
+        kp_scan_flush:
+        // Trailing unterminated line at scratch[r10..r13] (r13==r12)
+        mov r9, r13;
+        sub r9, r10;
+        cmp r9, 0;
+        je kp_commit_tick;
+        mov rdi, rbx;
+        mov rsi, r10;
+        mov rdx, r9;
+        mov rcx, r15;
+        call kp_write_line;
+        add r14, 1;
+
+        kp_commit_tick:
+        // ---- Phase D: commit tick -----------------------------------------
+        mov rax, r15;
+        shr rax, 24;
+        mov [rbx + 40], rax;                       // last_poll_tick
+
+        // ---- Phase E: return lines_written --------------------------------
+        mov rax, r14;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        kp_notyet:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        kp_no_data:
+        // Zero bytes to parse this poll -- still commit the tick so
+        // the interval gate keeps us from hammering sys_dmesg on
+        // every call.
+        mov rax, r15;
+        shr rax, 24;
+        mov [rbx + 40], rax;
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

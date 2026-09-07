@@ -1,0 +1,186 @@
+# postui-dmesg — caps.decl
+#
+# Wave: postui v1 reference apps
+# Milestone: M1 (scaffold + KIND_DMESG poll)
+# Doc:  paideia-os/postui/docs/design.md §3.3 (widget mix + data
+#       source for /bin/dmesg); paideia-os/postui/design/architecture.md
+#       §5.1 (error-band allocation table).
+#
+# postui-dmesg is the klog tail viewer that consumes the postui widget
+# library at exec time. Its cap footprint at M1-001 covers every
+# substrate the poll + eventual render paths will touch — the scaffold
+# declares the full set up front so the M2 render-landing and M4
+# semantic-pipe-emit landings do not need to reopen the manifest for
+# a re-sign.
+#
+# ---------------------------------------------------------------------
+# KIND_TUI_CANVAS — the render substrate (postui/docs/design.md §2.1)
+# ---------------------------------------------------------------------
+#
+# postui-dmesg holds one canvas cap per rendering surface (single
+# canvas for the fullscreen dmesg view at M2; the M3 tabs-per-severity
+# view stays inside one canvas via sub-region draws rather than a
+# compositor split — postui/docs/design.md §3.3 tabs treatment).
+#
+# Rights layout (mirrors R_TTY_* discipline; see postui/docs/design.md
+# §2.1 "Rights" table and postui-top/caps.decl for the same rationale):
+#
+#   R_TUI_PRESENT   0x002   diff + emit a frame (the write analogue)
+#   R_TUI_INVOKE    0x008   query ops (rows, cols, id, tty_id)
+#   R_TUI_RESIZE    0x010   TUI_OP_RESIZE / TUI_OP_CLEAR
+#   R_TUI_REVOKE    0x020   teardown the row
+#   R_TUI_MINT      0x200   derive a canvas from a KIND_MEMORY parent
+#   R_TUI_OBSERVE   0x400   debug printer
+#
+# At M1-001 postui-dmesg's poll module (src/klog_poll.pdx) does NOT
+# touch the canvas — the KIND_DMESG poll runs before any render. The
+# mint and present rights are declared HERE so the M1-005 render
+# landing (which introduces terminal_init + frame_render +
+# frame_present through postui) does not need a caps.decl churn:
+#
+#   * mint    — postui-dmesg mints its top-level canvas at Main::main
+#               startup via sys_cap_derive against a KIND_MEMORY parent
+#               (M1-005 landing).
+#   * present — every frame_render tail invokes TUI_OP_PRESENT via
+#               postui's tcc_present wrapper (M2-onwards render path).
+#
+# R_TUI_INVOKE / R_TUI_RESIZE / R_TUI_REVOKE are DEFERRED (declared at
+# M1-005 when the render path first exercises them); adding them at
+# this landing would over-declare authority the M1-001 poll surface
+# never uses.
+#
+# ---------------------------------------------------------------------
+# KIND_TTY — the input + physical-sink substrate (postui/docs/design.md
+# §2.5)
+# ---------------------------------------------------------------------
+#
+# Two independent uses (mirror postui / postui-top / shell's own
+# caps.decl):
+#
+#   * write — the canvas is provably wired to a live KIND_TTY at mint
+#     time (postui/docs/design.md §2.1: the row's tty_slot is validated
+#     via tty_tail_valid at cap_handler_tui_canvas mint). TUI_OP_PRESENT
+#     emits its ANSI byte stream through the tty_slot; the write right
+#     is transitively required at postui-dmesg mint time even though
+#     postui-dmesg code never issues TTY_OP_WRITE itself.
+#
+#   * read — the primary input path once postui.M4-007 lands (Terminal::
+#     terminal_read_input probes KIND_TTY raw-mode). The M2 TextInput
+#     filter widget consumes this. Declared here so the M2 filter
+#     landing does not need to widen the manifest.
+#
+# ---------------------------------------------------------------------
+# KIND_MEMORY — the canvas backing store (postui/docs/design.md §2.1)
+# ---------------------------------------------------------------------
+#
+# KIND_TUI_CANVAS derives over KIND_MEMORY (= KIND_PAGE, 4).
+# postui-dmesg mints a KIND_MEMORY region sized 2 * rows * cols *
+# CELL_BYTES at M1-005 startup and hands it to sys_cap_derive
+# (KIND_TUI_CANVAS, ...); the derived canvas cap is what postui
+# subsequently invokes for every PRESENT. The mint right must be
+# held; the derive-then-drop pattern means we do NOT hold KIND_MEMORY
+# authority after the derive completes.
+#
+# ---------------------------------------------------------------------
+# KIND_DMESG — the klog tail substrate (paideia-os
+# src/kernel/core/cap/kind_dmesg.pdx, logging-m9-001 #708)
+# ---------------------------------------------------------------------
+#
+# The forward-looking capability the poll module treats as its data
+# source. Kernel body defines two ops:
+#
+#   * OP_READ_TAIL (op_code 0)  — RIGHT_READ; copies up to `len` bytes
+#     of the klog ring tail into a caller-owned buffer. Returns bytes
+#     copied in rax.
+#   * OP_STAT      (op_code 1)  — RIGHT_READ; returns
+#     (head_lo32 << 32) | KLOG_RING_SIZE so a reader can track new
+#     bytes since its last poll.
+#
+# At M1-001 the poll module CANNOT actually invoke KIND_DMESG through
+# sys_cap_invoke because R18/R19 has no per-TCB cap-slot table for
+# userspace processes yet — kind_dmesg.pdx's own comment (see
+# `Cap descriptor: target_ptr = kernel VA of a caller-owned scratch
+# buffer`) and sys_dmesg.pdx's access-control note ("R18 has no
+# per-TCB cap-holder machinery yet — deferred to R19+ userspace-daemon
+# substrate, so at this landing sys_dmesg is unrestricted") both
+# reflect the same reality: the KIND_DMESG cap is minted at boot and
+# available for future gating, but the reachable userspace path today
+# is the sysno 13 (sys_dmesg) syscall, which wraps klog_ring_read_tail
+# with the same semantics OP_READ_TAIL exposes.
+#
+# The M1-001 poll module therefore uses sys_dmesg (sysno 13) directly
+# — see the syscalls block below and src/klog_poll.pdx's
+# kp_sys_dmesg wrapper. KIND_DMESG(read) is declared HERE so the
+# M2+ landing that switches from the sysno-13 fallback to
+# sys_cap_invoke (once TCB cap-slot machinery lands) does not need a
+# caps.decl churn — the manifest already claims the authority.
+#
+# Rights layout (see kind_dmesg.pdx SECTION 3 "Cap descriptor"):
+#
+#   RIGHT_READ      0x001   OP_READ_TAIL + OP_STAT both require this
+#
+# ---------------------------------------------------------------------
+requires:
+- KIND_TUI_CANVAS(mint, present)
+- KIND_TTY(write, read)
+- KIND_MEMORY(mint, revoke)
+- KIND_DMESG(read)
+
+# ---------------------------------------------------------------------
+# Syscall dependencies (informational; not consumed by the InitCap
+# sidecar — the syscall gate is a kernel-side dispatch decision, not a
+# per-process cap check at M1). Enumerated here so downstream tooling
+# (release lint, dependency-audit) that walks the tree can trace
+# postui-dmesg's SC+ surface without reading every .pdx source.
+#
+# The M1-001 poll path uses exactly two syscalls beyond what postui's
+# own render path already declares:
+#
+#   * sysno 13 — sys_dmesg(buf, len) -> bytes copied in [0, len]
+#                Kernel-to-userspace copy of the klog ring tail
+#                (logging-m9-002 #709; body at src/kernel/core/syscall/
+#                handlers/sys_dmesg.pdx wrapping klog_ring_read_tail).
+#                Idempotent-peek POSIX-style contract: every call
+#                returns the current ring tail bytes; no consume-cursor
+#                is maintained kernel-side (the M2+ streaming landing
+#                will track head via KIND_DMESG OP_STAT once cap-slot
+#                machinery is reachable). Dispatch shim caps `len` at
+#                DISPATCH_IO_MAX (4096 bytes) — see dispatch.pdx
+#                dispatch_dmesg_len_ok.
+#   * sysno 66 — sys_clock_read_ns() -> u64 ns
+#                Monotonic ns-since-boot counter. KlogPoll uses it to
+#                gate the fixed-interval poll_tick refresh (converting
+#                interval_ticks to a compatible ns-domain deadline via
+#                shift, per src/klog_poll.pdx §Tick semantics — same
+#                2^24-ns tick shape postui-top adopted).
+# ---------------------------------------------------------------------
+syscalls:
+- sys_dmesg         @ 13
+- sys_clock_read_ns @ 66
+
+# ---------------------------------------------------------------------
+# Declared output schemas
+# ---------------------------------------------------------------------
+#
+# postui-dmesg emits one first-class semantic-pipe schema at M4-004:
+#
+#   * DmesgLineView@0.1 — one record per parsed klog line, mirroring
+#                         the internal log_line struct (severity u64,
+#                         timestamp_ns u64, text_ptr u64, text_len u64
+#                         = 32 wire bytes; the +32..+255 reserved
+#                         growth region stays in-process, not on the
+#                         wire). Emitted through the KIND_IPC_ENDPOINT
+#                         postui-dmesg binds at Main::main startup
+#                         (M2-005 wire-in). Every downstream scraper
+#                         (e.g. a monitoring daemon that pulls
+#                         DmesgLineView via `dmesg | scraper`) reads
+#                         the same 32-byte-BLAKE3 schema hash under
+#                         the libpdx-semantic-pipe v1 contract.
+#
+# At M1-001 the emitter path is scaffolding only (klog_poll.pdx
+# populates the in-memory line ring; no envelope encoder runs). The
+# schema name is declared here so the M4-004 landing does not need to
+# introduce it and the downstream dependency-audit tree already sees
+# postui-dmesg as a DmesgLineView producer.
+declares_output_schemas:
+- DmesgLineView@0.1
