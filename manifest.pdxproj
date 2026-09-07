@@ -53,6 +53,7 @@ sources:
   - src/klog_poll.pdx             # M1-001: KlogState + klog_poll_init + klog_poll_tick KIND_DMESG consumer
   - src/view_list.pdx             # M2-001: ViewList adapter (log_line -> Line+Span) + auto-scroll List render
   - src/view_tabs.pdx             # M3-002: ViewTabs 5-tab severity strip [All|Emerg|Err|Warn|Info] + view_tabs_match filter predicate
+  - src/view_filter.pdx           # M3-001 (postui-dmesg#3): ViewFilter TextInput + FilterState + naive strstr match predicate
 
 # --- Library dependencies -----------------------------------------------
 # postui (the widget library at ../postui, v1.0.0 shipped at

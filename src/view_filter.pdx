@@ -1,0 +1,806 @@
+// src/view_filter.pdx -- postui-dmesg.M3-001 (paideia-os/postui-dmesg#3)
+//
+// ViewFilter module: TextInput-backed substring filter over the KlogPoll
+// log-line ring. Owns a small inline UTF-8 buffer, translates raw key
+// codes into byte-level insert/backspace edits, renders itself as a
+// single-row TextInput on the top row of the frame, and exposes a naive
+// substring predicate for the render pipeline to gate log_line
+// visibility on.
+//
+// =============================================================================
+// SCOPE (postui/docs/design.md §3.3 postui-dmesg reference app, M3-001 slot)
+// =============================================================================
+//
+// M1-001 landed the KIND_DMESG poll (src/klog_poll.pdx) and M2-001
+// landed the auto-scroll List render (src/view_list.pdx). This landing
+// adds the interactive filter surface: a TextInput widget bound to a
+// per-frame substring filter that the frame composer applies against
+// every log_line before it lands in view_list's adapter table.
+//
+// Four callable entries land at M3-001:
+//
+//   view_filter_init(state) -> u64
+//     Zero every FilterState field, point filter_ptr at the inline text
+//     buffer, and set filter_capacity to VF_INLINE_BUF_BYTES (112).
+//     Returns 0 unconditionally (no validation gate at v1; a future
+//     landing may reserve a VF_ERR_* band in 0xFFFFE01x for null-state
+//     and cursor-out-of-range diagnostics).
+//
+//   view_filter_input(state, key_code) -> u64
+//     Translate one keyboard key code into either an insert-byte or
+//     backspace edit against the filter buffer. Printable ASCII
+//     (0x20..0x7E) inserts at cursor_pos, shifting the tail right and
+//     bumping len + cursor. Backspace (0x08) or DEL (0x7F) removes the
+//     byte immediately before cursor_pos, shifts the tail left and
+//     decrements len + cursor. Every other key code is a silent no-op.
+//     A buffer-full insert (filter_len == filter_capacity) and a
+//     cursor-at-start backspace (cursor_pos == 0) are both silent no-
+//     ops -- the sole return path is `xor rax, rax; ret`, so a caller
+//     wiring this into a keydown handler does not need to key on
+//     specific error sentinels (the M3-002 landing can introduce a
+//     one-bit "buffer full" hint via the rax return without breaking
+//     the current caller contract). This design matches how
+//     TextInput's own text_input_insert / text_input_delete surface
+//     TI_ERR_BUFFER_FULL / TI_ERR_CURSOR_AT_START -- callers that
+//     want an audible bell wire against the low-level primitive; the
+//     high-level `input` entry here is the "editor stack" the
+//     text_input.pdx module header calls out.
+//
+//   view_filter_render(state, buf, rows, cols) -> u64
+//     Build a 72-byte TextInputSpec on the stack targeting the top
+//     row of the frame -- rect = (x=0, y=0, w=cols, h=1) -- and
+//     dispatch text_input_draw(spec, buf, rows, cols). SingleLine
+//     mode (TI_MODE_SINGLE = 0) so the widget renders the buffer as
+//     one visible row with the block cursor stamped at cursor_pos.
+//     Returns text_input_draw's rax verbatim (0 = OK at v1 per
+//     postui/src/widgets/text_input.pdx TI_ERR_BAND). The `rows`
+//     argument is passed through unchanged so text_input_draw's
+//     signature is fed correctly, but ViewFilter only OCCUPIES row
+//     0 -- rows [1..rows) are the caller's to hand over to
+//     view_list_render, which the frame composer wires in the same
+//     `Main::main` step that will land at M1-005 (the composer
+//     shape: view_filter_render(state, buf, rows, cols) followed by
+//     view_list_render(klog_state, buf + cols * CELL_BYTES,
+//     rows - 1, cols) so the two widgets stack without overlap).
+//
+//   view_filter_match(state, log_line_ptr) -> u64
+//     Return 1 if the log_line's text contains the filter substring,
+//     0 otherwise. Empty filter (filter_len == 0) matches every line
+//     unconditionally -- the caller can therefore invoke this in the
+//     inner adapter loop without a separate "is the filter armed"
+//     branch, letting the frame composer keep the M2-001 adapter loop
+//     shape byte-for-byte. Algorithm is naive strstr: for each
+//     candidate start in [0, text_len - filter_len], byte-compare the
+//     filter against text[start..start+filter_len]; on a full match
+//     return 1, else advance start. O(text_len * filter_len) worst
+//     case, but filter_len is capped at 112 and text_len is capped at
+//     LINE_TEXT_MAX = 256 in KlogPoll, so worst-case per-line is
+//     ~28.6K comparisons -- comfortably below the per-frame budget
+//     even for a 64-line ring. A future landing can swap this for
+//     Boyer-Moore-Horspool once the frame budget tightens (the
+//     public predicate signature is unchanged).
+//
+// =============================================================================
+// FILTERSTATE LAYOUT (160 bytes, VF_STATE_BYTES)
+// =============================================================================
+//
+//   [+  0..+  8)   filter_ptr        u64 pointer to the inline byte
+//                                     buffer at state + VF_INLINE_BUF_OFF.
+//                                     Stored (not computed on demand)
+//                                     so a downstream reader -- the
+//                                     TextInputSpec builder inside
+//                                     view_filter_render in particular
+//                                     -- can copy the pointer straight
+//                                     into the spec's buffer_ptr slot
+//                                     with a single mov, matching the
+//                                     text_input.pdx §Register plan
+//                                     "cache spec fields once" shape.
+//                                     A copy-out here also means the
+//                                     view_filter_match predicate does
+//                                     not have to know the inline_buf
+//                                     offset -- one load through state
+//                                     + 0 gets it.
+//
+//   [+  8..+ 16)   filter_len        u64 current used bytes in the
+//                                     inline buffer, in [0, capacity].
+//                                     Bumped by insert (+1) and
+//                                     backspace (-1). 0 means empty
+//                                     filter -- every log line matches.
+//
+//   [+ 16..+ 24)   filter_capacity   u64 maximum bytes the inline
+//                                     buffer holds. Set to 112 by
+//                                     view_filter_init and never
+//                                     mutated afterwards; a future
+//                                     landing that wants a growable
+//                                     buffer can swap the inline-buf
+//                                     backing for a caller-provided
+//                                     pointer and rewrite this field
+//                                     in view_filter_init.
+//
+//   [+ 24..+ 32)   cursor_pos        u64 byte offset of the edit
+//                                     cursor within the buffer, in
+//                                     [0, filter_len]. cursor_pos ==
+//                                     filter_len is the "cursor at
+//                                     end" state; a valid cursor at
+//                                     v1 is a byte-level position
+//                                     (this module is byte-oriented,
+//                                     mirroring text_input_insert /
+//                                     text_input_delete). Codepoint-
+//                                     aware cursor movement (via
+//                                     text_input_cursor_left /
+//                                     cursor_right) is a M3-002+
+//                                     item.
+//
+//   [+ 32..+ 48)   _reserved         u32[4]  16 bytes of forward-
+//                                     declared growth room (per-
+//                                     match hit counter, case-
+//                                     insensitive flag, regex/glob
+//                                     mode enum, last_match_line
+//                                     cursor snapshot for the M3-003
+//                                     jump-to-next-match hotkey).
+//                                     Zeroed by view_filter_init so
+//                                     an M3-002+ reader can trust
+//                                     an unset slot as 0. Held as
+//                                     u32 rather than u64 so the
+//                                     four future flags/counters
+//                                     fit inside a single 16-byte
+//                                     header slot; a future landing
+//                                     that needs a full 64-bit slot
+//                                     folds two adjacent u32s or
+//                                     migrates to a u64 slot before
+//                                     the inline_buf region.
+//
+//   [+ 48..+160)   inline_buf[112]   u8   filter text bytes, byte-
+//                                     addressable via filter_ptr.
+//                                     Never contains a trailing NUL
+//                                     (filter_len bounds the live
+//                                     region; bytes beyond are
+//                                     stale). Chosen at 112 bytes
+//                                     to match a comfortable single-
+//                                     terminal-row filter length
+//                                     (typical dmesg searches are
+//                                     10-20 bytes -- "warn", "sched:",
+//                                     "usb-", the ID of a specific
+//                                     device -- and 112 covers even
+//                                     the pathological "regex-ish"
+//                                     patterns the M3-002 landing
+//                                     may expose).
+//
+// The M3-001 issue text sketched a "~128B" state; the resolved layout
+// (32-byte named-fields header + 16-byte reserved region + 112-byte
+// inline_buf = 160 bytes) prefers keeping every named field a full
+// qword (pointer-sized so filter_ptr in particular does not truncate)
+// and honoring the 112-byte inline_buf ceiling verbatim, at the cost
+// of a 32-byte overshoot on the header approximation. Two L1D lines
+// (128 bytes) still hold the entire hot header (filter_ptr through
+// _reserved) with the third line covering inline_buf.
+//
+// =============================================================================
+// KEYBOARD SEMANTICS (view_filter_input classification)
+// =============================================================================
+//
+// The M3-001 landing takes a raw u64 key_code as the second argument.
+// Semantics:
+//
+//   key_code == 0x08 (BS)       -> backspace (delete byte before cursor)
+//   key_code == 0x7F (DEL)      -> backspace (same treatment; some
+//                                    terminals ship DEL for the physical
+//                                    Backspace key, others ship BS)
+//   0x20 <= key_code <= 0x7E    -> insert byte (printable ASCII)
+//   everything else             -> silent no-op (returns 0)
+//
+// UTF-8 multi-byte input, function keys, arrow keys, control
+// combinations (Ctrl+U to clear, etc.) are all no-ops at M3-001. A
+// M3-002+ landing may add:
+//   - Arrow-left / arrow-right -> codepoint-aware cursor movement via
+//     text_input_cursor_left / text_input_cursor_right.
+//   - Home / End                -> cursor_pos = 0 / cursor_pos = filter_len.
+//   - Ctrl+U                    -> clear the buffer (filter_len = 0,
+//     cursor_pos = 0).
+//   - UTF-8 multibyte insert    -> the caller assembles a byte
+//     sequence and calls insert once per byte.
+//
+// The classification uses only imm8/imm32 compares (0x08, 0x20, 0x7E,
+// 0x7F all fit imm8), avoiding any `and reg, imm64` gate that would
+// break the paideia-as encoder discipline.
+//
+// =============================================================================
+// TEXTINPUT WIRING (view_filter_render sequence)
+// =============================================================================
+//
+// view_filter_render builds a 72-byte TextInputSpec directly on the
+// stack (rather than caching one in .bss) so the rect field is re-
+// derived from the caller-supplied (rows, cols) every frame -- picking
+// up a SIGWINCH-driven resize on the next call for zero bookkeeping
+// cost, matching view_list.pdx's own ListSpec-on-stack posture. The
+// spec's nine u64 slots are written by hand rather than through
+// text_input_spec_init because our field values do not naturally pack
+// into text_input_spec_init's u32-halved argument budget (buffer_ptr,
+// buffer_cap, buffer_len, cursor_byte are all natural u64s from the
+// state header, and forcing them through a shl 32; shr 32 truncation
+// pair would only serve the packed-args ABI, not any correctness
+// requirement).
+//
+// Spec layout (per postui/src/widgets/text_input.pdx §TEXTINPUTSPEC
+// WIRE, offsets identical here for cross-reference):
+//
+//   [rsp+ 0]  rect         = pack(x=0, y=0, w=cols, h=1)
+//                             = (1 << 48) | (cols << 32)
+//                             (x and y both zero, so the low 32 bits
+//                              are 0; the widget draws in the top-
+//                              left corner exclusively)
+//   [rsp+ 8]  buffer_ptr   = state.filter_ptr
+//   [rsp+16]  buffer_cap   = state.filter_capacity
+//   [rsp+24]  buffer_len   = state.filter_len
+//   [rsp+32]  cursor_byte  = state.cursor_pos
+//   [rsp+40]  scroll_col   = 0                    (M3-001 wraps everything
+//                                                   into view; a M3-002+
+//                                                   landing that lets the
+//                                                   filter grow past the
+//                                                   terminal width picks
+//                                                   up horizontal scroll
+//                                                   here)
+//   [rsp+48]  mode         = TI_MODE_SINGLE (0)   (one-row filter; the
+//                                                   MultiLine path is
+//                                                   reserved for editor-
+//                                                   shaped consumers of
+//                                                   TextInput)
+//   [rsp+56]  style_normal = 0                    (default cell style;
+//                                                   the M3-003+ landing
+//                                                   that colours the
+//                                                   filter row can patch
+//                                                   these two slots
+//                                                   before the dispatch)
+//   [rsp+64]  style_cursor = 0
+//
+// text_input_draw is called via a bare `call text_input_draw` per the
+// postui flat symbol namespace (matches view_list.pdx's `call
+// list_draw`). Rect (1 << 48) is composed at runtime via `mov r8, 1;
+// shl r8, 48; or rax, r8` rather than a movabs imm64 -- the 48-bit
+// shift keeps every immediate in the compact imm8 form and the OR
+// takes a register-register operand.
+//
+// =============================================================================
+// MATCH ALGORITHM (view_filter_match strstr)
+// =============================================================================
+//
+// Empty filter shortcut: filter_len == 0 -> return 1 (match). This
+// lets the frame composer invoke view_filter_match unconditionally in
+// its adapter loop; the "no filter armed" path stays branch-cheap.
+//
+// Bound check: text_len < filter_len -> return 0 (no possible embedding
+// of the filter in the text).
+//
+// Naive walk: for start in [0, text_len - filter_len], compare filter[j]
+// against text[start + j] for j in [0, filter_len). On a full match
+// (inner loop reaches j == filter_len) return 1; on any byte mismatch
+// break the inner loop and advance start. Fall through returns 0.
+//
+// Byte loads use the `xor reg, reg; mov_b reg, [ptr]` shape per the
+// byte-load-zero-then-mov_b compliance flag (matches klog_poll.pdx
+// kp_write_line's copy loop). All compares against register-held
+// values, never `cmp reg, [mem]`. Every immediate (0, 1) fits imm8.
+//
+// Register plan (pure leaf; no push/pop, no nested calls):
+//   r8  = filter_ptr        (loaded from [rdi + 0])
+//   r9  = filter_len        (loaded from [rdi + 8])
+//   r10 = text_ptr          (loaded from [rsi + 16] per log_line wire)
+//   r11 = text_len          (loaded from [rsi + 24] per log_line wire)
+//   rdx = start             (outer loop counter)
+//   rcx = j                 (inner loop counter)
+//   rdi, rsi                (repurposed as byte-load pointers after
+//                              the initial state / log_line reads)
+//   rax = byte scratch, return value
+//
+// Every register touched is SysV caller-save -- no callee-save writes,
+// no push/pop. Note r11 is used to hold text_len across the two loops
+// but the routine emits NO `lea` (all pointer math is `mov + add`), so
+// the paideia-as internal-r11-clobber-on-lea pitfall never bites.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (same set klog_poll.pdx / view_list.pdx use)
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ViewFilter`), matches file
+//     basename view_filter.pdx per the module-basename-pascal
+//     compliance flag.
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0` (or a
+//     `cmp reg, imm8` against a small constant).
+//   - Every immediate in cmp/and fits imm32. Widest is 0xFFFF (the
+//     rect x/y/w/h field mask in the render spec builder). Every
+//     shift count (32, 48) fits imm8. Sentinels > 0x7FFFFFFF are
+//     never used in cmp/and; the M3-001 landing does not introduce
+//     any (input errors are silent no-ops, not returned sentinels).
+//   - No 2-op `imul reg, imm`; the module emits no `imul` at all
+//     (no row-stride math -- render works off a single-row rect,
+//     match works off byte offsets computed with `add`, not
+//     multiplication).
+//   - No `mul` mnemonic; no `and reg, imm64` (widest and-mask is
+//     0xFFFF); no `cmp reg, [mem]` (every compare loads through a
+//     scratch first).
+//   - `xor reg, reg; mov_b reg, [ptr]` byte-load shape wherever a
+//     byte is read from memory (view_filter_input's shift loops,
+//     view_filter_match's inner compare). Byte-STORES via `mov_b
+//     [ptr], reg` are unaffected by the load-side zero-extension
+//     pitfall.
+//   - r11 usage: view_filter_input and view_filter_match both use
+//     r11 as a byte-transit scratch. Neither function uses `lea`
+//     (paideia-as's internal r11 clobber is on `lea` emission and
+//     `mov rN, [rip + label]` patterns), so r11 survives across
+//     every intra-function step where the plan expects it to. The
+//     view_filter_render body uses `lea` twice (for _vf_ nothing --
+//     actually, no: view_filter_render also avoids `lea` since the
+//     TextInputSpec lives on the stack, not a labeled .bss slot,
+//     and text_input_draw is reached via `call text_input_draw`,
+//     not `lea reg, [rip + text_input_draw]`).
+//   - SysV push/pop parity:
+//       * view_filter_init: pure leaf, no push/pop, seven qword
+//         stores through rdi + one small zero loop.
+//       * view_filter_input: pure leaf, no push/pop, five qword
+//         reads + two shift loops (both in caller-save regs) + two
+//         qword stores.
+//       * view_filter_render: 2-push callee-save prologue (rbx +
+//         r12 = 16 B; entry rsp%16==8, +16==0; `sub rsp, 72` keeps
+//         rsp aligned for the nested `call text_input_draw` because
+//         72 mod 16 == 8 and 0 - 8 == 8 mod 16 == 8; wait -- entry
+//         rsp%16==8, after 2 pushes rsp%16==(8-16) mod 16 == 8;
+//         after sub 72 rsp%16==(8-72) mod 16 == (8-8) mod 16 == 0.
+//         Aligned).
+//       * view_filter_match: pure leaf, no push/pop.
+//   - Cross-module call convention: bare `call text_input_draw` per
+//     the frame.pdx / text.pdx / view_gauge.pdx / view_list.pdx
+//     precedent. paideia-as's flat symbol namespace resolves
+//     TextInput::text_input_draw by name without any module::function
+//     prefix.
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names. Every label prefixed
+//     `vf_*` per the postui-dmesg fingerprint discipline; sub-
+//     prefixes: vf_init_ (init), vf_in_ (input), vf_rd_ (render),
+//     vf_mt_ (match). Substring "loop" avoided defensively (uses
+//     `_step_` / `_shift_` / `_outer` / `_inner`).
+//   - `pub let` single-line declarations only (multiline `pub let
+//     ="..."` is a paideia-as pitfall).
+
+module ViewFilter = structure {
+
+  // ==========================================================================
+  // FilterState sizing / structural constants (locked at M3-001 landing).
+  // ==========================================================================
+  pub let VF_STATE_BYTES        : u64 = 160
+  pub let VF_INLINE_BUF_BYTES   : u64 = 112
+
+  // ==========================================================================
+  // FilterState field offsets (see §FILTERSTATE LAYOUT in module header).
+  // ==========================================================================
+  pub let VF_OFF_FILTER_PTR      : u64 = 0
+  pub let VF_OFF_FILTER_LEN      : u64 = 8
+  pub let VF_OFF_FILTER_CAPACITY : u64 = 16
+  pub let VF_OFF_CURSOR_POS      : u64 = 24
+  pub let VF_OFF_RESERVED        : u64 = 32
+  pub let VF_OFF_INLINE_BUF      : u64 = 48
+
+  // ==========================================================================
+  // KlogPoll log_line field offsets we depend on (see klog_poll.pdx
+  // §log_line layout). Named locally so a downstream reader can trace
+  // every displacement back to KlogPoll::KP_LINE_OFF_* without decoding
+  // raw numerals.
+  // ==========================================================================
+  pub let VF_KP_LINE_OFF_TEXT_PTR : u64 = 16
+  pub let VF_KP_LINE_OFF_TEXT_LEN : u64 = 24
+
+  // ==========================================================================
+  // TextInput mode ordinal we depend on (see postui/src/widgets/text_
+  // input.pdx §Mode ordinals). Named locally to keep the M3-001 landing
+  // decoupled from the module-qualifier lookup.
+  // ==========================================================================
+  pub let VF_TI_MODE_SINGLE : u64 = 0
+
+  // ==========================================================================
+  // Key-code sentinels (see §KEYBOARD SEMANTICS in module header).
+  // All fit imm8 (< 0x80).
+  // ==========================================================================
+  pub let VF_KEY_BS            : u64 = 0x08
+  pub let VF_KEY_DEL           : u64 = 0x7F
+  pub let VF_KEY_PRINTABLE_LO  : u64 = 0x20
+  pub let VF_KEY_PRINTABLE_HI  : u64 = 0x7E
+
+  // ==========================================================================
+  // Return sentinel (v1). Every entry returns 0 on success (VF_OK); the
+  // M3-001 landing does not introduce any VF_ERR_* sentinel -- input
+  // errors are silent no-ops. The 0xFFFFE01x band claimed by KlogPoll
+  // has slots +4..+F reserved for postui-dmesg's M1-002+ diagnostics;
+  // ViewFilter can reserve a sub-band at a later landing without
+  // colliding.
+  // ==========================================================================
+  pub let VF_OK : u64 = 0
+
+  // ==========================================================================
+  // view_filter_init(state_ptr) -> u64
+  //
+  // Zero every FilterState field, set filter_ptr = state_ptr +
+  // VF_INLINE_BUF_OFF (48), and set filter_capacity = 112. The
+  // reserved region (+32..+48) and the inline buffer (+48..+160) are
+  // both zeroed by a small scan loop so an M3-002+ reader can trust
+  // an unset field as 0 without requiring every caller to pre-zero
+  // the struct.
+  //
+  // Contract:
+  //   rdi = state_ptr        VA of a >= VF_STATE_BYTES (160) struct
+  //   -> rax = 0             always (no validation at M3-001)
+  //
+  // Register plan: pure leaf (no push/pop, no nested call). rax is
+  // the shared zero-filler across every store; rcx is a small scratch
+  // for the filter_ptr and filter_capacity constants; r8 is the
+  // scan-loop dst pointer. No callee-save touched.
+  //
+  // Labels prefixed vf_init_ per fingerprint discipline (only the
+  // zero-scan loop needs labels; the field stamp prefix is straight-
+  // line).
+  // ==========================================================================
+  pub let view_filter_init : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-dmesg.M3-001 (postui-dmesg#3): FilterState field-stamp initializer. Contract SysV rdi=state_ptr, -> rax=0. Body: (Step 1) xor rax, rax so rax is the shared zero-filler across every subsequent store. (Step 2) Compute filter_ptr = state_ptr + VF_INLINE_BUF_OFF (48) via mov rcx, rdi; add rcx, 48; mov [rdi + 0], rcx -- stored at +0 per §FILTERSTATE LAYOUT. (Step 3) Store filter_len = 0 via mov [rdi + 8], rax; store filter_capacity = 112 via mov rcx, 112; mov [rdi + 16], rcx; store cursor_pos = 0 via mov [rdi + 24], rax. (Step 4) Zero the reserved region (+32..+48, 16 bytes = 2 qwords) and the inline buffer (+48..+160, 112 bytes = 14 qwords) via a shared scan loop: mov rcx, 32; vf_init_zero_step: cmp rcx, 160; jae vf_init_zero_end; mov r8, rdi; add r8, rcx; mov [r8 + 0], rax; add rcx, 8; jmp vf_init_zero_step; vf_init_zero_end. rax is preserved as 0 across the loop (nothing modifies it). (Step 5) Return rax = 0 = VF_OK. Encoder discipline: no `test` (all loop bounds via cmp reg, imm8/imm32); no imul (no row-stride math -- all offsets are qword-aligned constants added directly); no `and reg, imm64` (only immediates used are 0, 8, 32, 48, 112, 160 -- all imm8/imm32); no `cmp reg, [mem]` (the loop bound compares against a register-held cursor). Every field offset (0, 8, 16, 24, 32, 48) and every loop immediate fit imm8. Zero pushes/zero pops (pure leaf, no callee-save touched, no nested call). Labels prefixed vf_init_ per postui-dmesg fingerprint discipline (substring `loop` avoided: vf_init_zero_step / vf_init_zero_end). rax return path: since we ret immediately after the scan loop and rax was zeroed in Step 1 (never rewritten), no explicit xor rax, rax before ret is needed -- but included defensively as `ret` follows a store that used rax = 0 as source, keeping rax = 0.",
+      block: {
+        // Step 1: shared zero-filler.
+        xor rax, rax;
+
+        // Step 2: filter_ptr = state_ptr + VF_INLINE_BUF_OFF (48).
+        mov rcx, rdi;
+        add rcx, 48;
+        mov [rdi + 0], rcx;
+
+        // Step 3: filter_len = 0.
+        mov [rdi + 8], rax;
+
+        // filter_capacity = 112.
+        mov rcx, 112;
+        mov [rdi + 16], rcx;
+
+        // cursor_pos = 0.
+        mov [rdi + 24], rax;
+
+        // Step 4: zero [+32..+160) with a small scan loop (16 qwords).
+        mov rcx, 32;
+      vf_init_zero_step:
+        cmp rcx, 160;
+        jae vf_init_zero_end;
+        mov r8, rdi;
+        add r8, rcx;
+        mov [r8 + 0], rax;
+        add rcx, 8;
+        jmp vf_init_zero_step;
+      vf_init_zero_end:
+
+        // Step 5: return VF_OK (rax already 0 from Step 1).
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // view_filter_input(state_ptr, key_code) -> u64
+  //
+  // Translate one keyboard key code into either an insert-byte or
+  // backspace edit against the filter buffer. See §KEYBOARD SEMANTICS
+  // in the module header for the full classification table.
+  //
+  // Contract:
+  //   rdi = state_ptr        VA of a FilterState populated by view_filter_init
+  //   rsi = key_code         raw key code; only the low 8 bits are read
+  //                            for the byte insert (upper bits classified
+  //                            for BS/DEL/printable dispatch)
+  //   -> rax = 0             always (all non-mutating paths -- unclassified
+  //                            key, buffer-full insert, cursor-at-start
+  //                            backspace -- are silent no-ops)
+  //
+  // Register plan: pure leaf (no push/pop, no nested call). Uses only
+  // SysV caller-save regs: rax = filter_len / return, rcx = capacity,
+  // r8 = filter_ptr, r9 = cursor_pos / new cursor, rdx = shift index i,
+  // r10 = i +/- 1 temp, r11 = byte-transit scratch. rdi (state_ptr)
+  // and rsi (key_code) survive throughout -- both used as bases for
+  // reads and stores.
+  //
+  // Labels prefixed vf_in_ per fingerprint discipline.
+  // ==========================================================================
+  pub let view_filter_input : (u64, u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) (key_code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-dmesg.M3-001 (postui-dmesg#3): key-code to filter-buffer mutator. Contract SysV rdi=state_ptr, rsi=key_code, -> rax=0. Classification uses only cmp reg, imm8 (0x08 BS, 0x7F DEL, 0x20 printable low, 0x7E printable high) so every dispatch fits the imm8 slice of `cmp reg, imm`. Phase A (backspace dispatch): cmp rsi, 0x08; je vf_in_backspace; cmp rsi, 0x7F; je vf_in_backspace. Phase B (printable filter): cmp rsi, 0x20; jb vf_in_ret_ok (below space -- unclassified control byte, silent no-op); cmp rsi, 0x7F; jae vf_in_ret_ok (at DEL already handled or above -- silent no-op; note the jae 0x7F catches everything >= 0x7F which is correct since 0x7F was matched earlier and 0x80+ are all non-printable ASCII). Phase C (insert path): mov rax, [rdi+8] (filter_len); mov rcx, [rdi+16] (filter_capacity); cmp rax, rcx; jae vf_in_ret_ok (buffer full -- silent no-op, matches text_input_insert's TI_ERR_BUFFER_FULL contract translated to the high-level `silent no-op` policy). mov r8, [rdi+0] (filter_ptr); mov r9, [rdi+24] (cursor_pos). Shift-right walk: for i = filter_len down to cursor+1, buffer[i] = buffer[i-1]. mov rdx, rax (i = filter_len). vf_in_shift_right: cmp rdx, r9; jbe vf_in_write_byte (i <= cursor -> done); mov r10, rdx; sub r10, 1; xor r11, r11; mov_b r11, [r8 + r10 + 0]; mov_b [r8 + rdx + 0], r11; sub rdx, 1; jmp vf_in_shift_right. vf_in_write_byte: mov_b [r8 + r9 + 0], rsi (low byte of key_code lands at cursor). add r9, 1; mov [rdi+24], r9 (bump cursor); add rax, 1; mov [rdi+8], rax (bump filter_len). xor rax, rax; ret. Phase D (backspace path -- vf_in_backspace): mov r9, [rdi+24] (cursor_pos); cmp r9, 0; je vf_in_ret_ok (cursor at start -- silent no-op, matches TI_ERR_CURSOR_AT_START translated). mov r8, [rdi+0]; mov rax, [rdi+8] (filter_len). sub r9, 1 (new cursor). Shift-left walk: for i = new_cursor; i+1 < filter_len; i++: buffer[i] = buffer[i+1]. mov rdx, r9. vf_in_shift_left: mov r10, rdx; add r10, 1; cmp r10, rax; jae vf_in_bs_finish (i+1 >= filter_len -> done); xor r11, r11; mov_b r11, [r8 + r10 + 0]; mov_b [r8 + rdx + 0], r11; add rdx, 1; jmp vf_in_shift_left. vf_in_bs_finish: mov [rdi+24], r9 (new cursor); sub rax, 1; mov [rdi+8], rax (decrement filter_len). Fall through to vf_in_ret_ok. vf_in_ret_ok: xor rax, rax; ret. Encoder discipline: no `test` (all zero-checks via cmp reg, 0 / cmp reg, imm8); no imul (all pointer math via add reg, reg); no `and reg, imm64` (the classification masks are cmp-form, not and-form); no `cmp reg, [mem]` (every compare against register-held value loaded via prior mov); no `mul` mnemonic. Every immediate (0, 1, 8, 16, 24, 0x08, 0x20, 0x7E, 0x7F) fits imm8. Byte load uses `xor r11, r11; mov_b r11, [r8 + rN + 0]` per the byte-load-zero-then-mov_b compliance flag (matches klog_poll.pdx kp_write_line copy loop). Byte store `mov_b [r8 + r9 + 0], rsi` uses the low 8 bits of rsi -- byte stores are load-side-zero-extension-exempt. Zero pushes/zero pops (pure leaf, no callee-save touched, no nested call). Labels prefixed vf_in_ per postui-dmesg fingerprint discipline (substring `loop` avoided: vf_in_backspace / vf_in_shift_right / vf_in_write_byte / vf_in_shift_left / vf_in_bs_finish / vf_in_ret_ok).",
+      block: {
+        // Phase A: backspace dispatch.
+        cmp rsi, 0x08;
+        je  vf_in_backspace;
+        cmp rsi, 0x7F;
+        je  vf_in_backspace;
+
+        // Phase B: printable filter.
+        cmp rsi, 0x20;
+        jb  vf_in_ret_ok;                  // below space -> no-op
+        cmp rsi, 0x7F;
+        jae vf_in_ret_ok;                  // at/above DEL -> no-op
+
+        // Phase C: insert path.
+        mov rax, [rdi + 8];                // filter_len
+        mov rcx, [rdi + 16];               // filter_capacity
+        cmp rax, rcx;
+        jae vf_in_ret_ok;                  // buffer full -> silent no-op
+
+        mov r8, [rdi + 0];                 // filter_ptr
+        mov r9, [rdi + 24];                // cursor_pos
+
+        // Shift right: for i = filter_len; i > cursor; i--
+        //   buffer[i] = buffer[i-1]
+        mov rdx, rax;                      // i = filter_len
+      vf_in_shift_right:
+        cmp rdx, r9;
+        jbe vf_in_write_byte;              // i <= cursor -> done
+        mov r10, rdx;
+        sub r10, 1;
+        xor r11, r11;
+        mov_b r11, [r8 + r10 + 0];         // r11 = buffer[i-1]
+        mov_b [r8 + rdx + 0], r11;         // buffer[i] = r11
+        sub rdx, 1;
+        jmp vf_in_shift_right;
+
+      vf_in_write_byte:
+        // buffer[cursor] = low byte of key_code
+        mov_b [r8 + r9 + 0], rsi;
+
+        // Bump cursor and filter_len.
+        add r9, 1;
+        mov [rdi + 24], r9;                // cursor_pos
+        add rax, 1;
+        mov [rdi + 8], rax;                // filter_len
+
+        xor rax, rax;
+        ret;
+
+        // ---- Backspace path -----------------------------------------------
+      vf_in_backspace:
+        mov r9, [rdi + 24];                // cursor_pos
+        cmp r9, 0;
+        je  vf_in_ret_ok;                  // cursor at start -> no-op
+
+        mov r8, [rdi + 0];                 // filter_ptr
+        mov rax, [rdi + 8];                // filter_len
+
+        // new cursor = cursor - 1.
+        sub r9, 1;
+
+        // Shift left: for i = new_cursor; i+1 < filter_len; i++
+        //   buffer[i] = buffer[i+1]
+        mov rdx, r9;                       // i = new_cursor
+      vf_in_shift_left:
+        mov r10, rdx;
+        add r10, 1;
+        cmp r10, rax;
+        jae vf_in_bs_finish;               // i+1 >= filter_len -> done
+        xor r11, r11;
+        mov_b r11, [r8 + r10 + 0];         // r11 = buffer[i+1]
+        mov_b [r8 + rdx + 0], r11;         // buffer[i] = r11
+        add rdx, 1;
+        jmp vf_in_shift_left;
+
+      vf_in_bs_finish:
+        mov [rdi + 24], r9;                // cursor_pos
+        sub rax, 1;
+        mov [rdi + 8], rax;                // filter_len
+
+      vf_in_ret_ok:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // view_filter_render(state_ptr, buf, rows, cols) -> u64
+  //
+  // Build a 72-byte TextInputSpec on the stack targeting the top row of
+  // the frame (rect = x=0, y=0, w=cols, h=1) and dispatch text_input_
+  // draw. See §TEXTINPUT WIRING in the module header for the field-by-
+  // field spec-build sequence.
+  //
+  // Contract:
+  //   rdi = state_ptr        VA of a FilterState populated by view_filter_init
+  //   rsi = buf              VA of a `rows * cols` grid of 16-byte Cells
+  //   rdx = rows             terminal row count (passed through to
+  //                            text_input_draw for signature uniformity;
+  //                            the widget itself only writes to row 0
+  //                            because rect.h == 1)
+  //   rcx = cols             terminal column count (widget width)
+  //   -> rax                 text_input_draw's return verbatim (0 = OK)
+  //
+  // Register plan (2 pushes + sub rsp, 72):
+  //   Entry rsp%16 == 8. Push rbx + push r12 -> rsp%16 == 8 (each push
+  //   flips %16 by 8; two pushes wrap back). sub rsp, 72 flips %16 by
+  //   8 (72 mod 16 == 8), landing on rsp%16 == 0 for the nested `call
+  //   text_input_draw`.
+  //
+  //   rbx = state_ptr        (survives spec-build to feed field loads)
+  //   r12 = buf              (survives spec-build to feed the call arg)
+  //   rdx = rows             (never touched below; still holds arg
+  //                            value at call time)
+  //   rcx = cols             (only READ into rax during rect pack; rcx
+  //                            itself never modified, still holds arg
+  //                            value at call time)
+  //   Stack:
+  //     [rsp+ 0..+72)  TextInputSpec (nine u64 slots)
+  //
+  // Labels prefixed vf_rd_ per fingerprint discipline (only the mode
+  // constant zero-init and the epilogue would need labels; the render
+  // body is straight-line).
+  // ==========================================================================
+  pub let view_filter_render : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) (buf: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-dmesg.M3-001 (postui-dmesg#3): view_filter_render builds a TextInputSpec on the stack targeting the top frame row and dispatches text_input_draw. 2-push callee-save prologue (rbx=state_ptr, r12=buf) = 16B; entry SysV rsp%16==8, after 2 pushes rsp%16 flips twice to land at 8, then sub rsp, 72 (72 mod 16 == 8) flips %16 to 0 -- aligned for the nested `call text_input_draw`. Phase A (arg cache): mov rbx, rdi (state_ptr); mov r12, rsi (buf). rdx=rows and rcx=cols are NOT copied because no code path below modifies them before the call site -- they survive as SysV args throughout the spec-build. Phase B (spec build at [rsp+0..+72), 9 u64 slots per postui/src/widgets/text_input.pdx §TEXTINPUTSPEC WIRE): [rsp+0] rect = (h=1<<48) | (w=cols<<32) | (y=0<<16) | (x=0). Rect pack: mov rax, rcx (cols); and rax, 0xFFFF (imm32-safe mask, 16-bit width); shl rax, 32; mov r8, 1; shl r8, 48; or rax, r8; mov [rsp+0], rax. The (1<<48) constant is built at runtime via mov r8, 1; shl r8, 48 rather than a movabs imm64 -- both imm8-fit and register-safe. [rsp+8] buffer_ptr = state.filter_ptr: mov rax, [rbx+0]; mov [rsp+8], rax. [rsp+16] buffer_cap = state.filter_capacity: mov rax, [rbx+16]; mov [rsp+16], rax. [rsp+24] buffer_len = state.filter_len: mov rax, [rbx+8]; mov [rsp+24], rax. [rsp+32] cursor_byte = state.cursor_pos: mov rax, [rbx+24]; mov [rsp+32], rax. [rsp+40] scroll_col = 0, [rsp+48] mode = TI_MODE_SINGLE (0), [rsp+56] style_normal = 0, [rsp+64] style_cursor = 0: xor rax, rax; mov [rsp+40], rax; mov [rsp+48], rax; mov [rsp+56], rax; mov [rsp+64], rax. Phase C (dispatch): mov rdi, rsp (spec_ptr); mov rsi, r12 (buf); rdx (rows) and rcx (cols) unchanged from entry; call text_input_draw. Return in rax verbatim (text_input_draw returns 0 = OK at v1 per its TI_ERR_BAND documentation; a future validation revision that returns TI_ERR_BAND propagates through unchanged). Phase D (epilogue): add rsp, 72; pop r12; pop rbx; ret. Encoder discipline: no `test` (no zero-checks in this body); no `imul` (no row-stride math -- rect pack uses shl, spec stores use qword mov); no `and reg, imm64` (the 0xFFFF mask on the cols extract fits imm32); no `cmp reg, [mem]` (no compares at all); no `mul` mnemonic. Every immediate (0, 1, 8, 16, 24, 32, 40, 48, 56, 64, 72, 0xFFFF) fits imm32; every shift count (32, 48) fits imm8. No sentinel > 0x7FFFFFFF -- (1 << 48) is composed via mov r8, 1; shl r8, 48 rather than loaded as a movabs imm64. No `lea` in this body -- the spec is stack-allocated (addressed via rsp + offset) and text_input_draw is called by name (paideia-as flat symbol namespace, matches view_list.pdx's `call list_draw`). Cross-module call: bare `call text_input_draw`. text_input_draw preserves rbx and r12 across its own 5-push callee-save prologue per postui/src/widgets/text_input.pdx L344-L347 (rsp aligned for the call, spec_ptr / buf survive on the caller's stack, rdx / rcx unread by our body). Effect `!{mem}` covers state reads at [rbx+0/+8/+16/+24], stack spec writes, and cell writes through text_input_draw into buf. Labels prefixed vf_rd_ per postui-dmesg fingerprint discipline (body is straight-line; no branches -> no labels needed).",
+      block: {
+        push rbx;
+        push r12;
+        sub  rsp, 72;
+
+        // Phase A: cache args in callee-save regs. rdx (rows) and rcx
+        // (cols) are NOT copied -- no code path below modifies them
+        // before the call site.
+        mov rbx, rdi;                      // state_ptr
+        mov r12, rsi;                      // buf
+
+        // Phase B: build TextInputSpec at [rsp+0..+72).
+        //
+        // [rsp+0] rect = (h=1 << 48) | (w=cols << 32) | (y=0 << 16) | x=0
+        mov rax, rcx;                      // cols
+        and rax, 0xFFFF;
+        shl rax, 32;                       // rax = cols << 32
+        mov r8, 1;
+        shl r8, 48;                        // r8  = 1 << 48
+        or  rax, r8;
+        mov [rsp + 0], rax;                // rect
+
+        // [rsp+8] buffer_ptr = state.filter_ptr
+        mov rax, [rbx + 0];
+        mov [rsp + 8], rax;
+
+        // [rsp+16] buffer_cap = state.filter_capacity
+        mov rax, [rbx + 16];
+        mov [rsp + 16], rax;
+
+        // [rsp+24] buffer_len = state.filter_len
+        mov rax, [rbx + 8];
+        mov [rsp + 24], rax;
+
+        // [rsp+32] cursor_byte = state.cursor_pos
+        mov rax, [rbx + 24];
+        mov [rsp + 32], rax;
+
+        // [rsp+40] scroll_col = 0
+        // [rsp+48] mode        = TI_MODE_SINGLE (0)
+        // [rsp+56] style_normal = 0
+        // [rsp+64] style_cursor = 0
+        xor rax, rax;
+        mov [rsp + 40], rax;
+        mov [rsp + 48], rax;
+        mov [rsp + 56], rax;
+        mov [rsp + 64], rax;
+
+        // Phase C: dispatch text_input_draw(spec_ptr, buf, rows, cols).
+        mov rdi, rsp;                      // spec_ptr = &TextInputSpec
+        mov rsi, r12;                      // buf
+        // rdx (rows) and rcx (cols) unchanged from entry.
+        call text_input_draw;
+
+        // Phase D: epilogue -- rax carries text_input_draw's return.
+        add rsp, 72;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // view_filter_match(state_ptr, log_line_ptr) -> u64
+  //
+  // Naive strstr predicate: return 1 if log_line.text contains the
+  // filter substring (or if filter_len == 0, in which case every line
+  // matches), 0 otherwise. See §MATCH ALGORITHM in the module header
+  // for the full sketch.
+  //
+  // Contract:
+  //   rdi = state_ptr        VA of a FilterState (only filter_ptr and
+  //                            filter_len are read; cursor_pos and
+  //                            capacity are ignored)
+  //   rsi = log_line_ptr     VA of a 256-byte log_line record (only
+  //                            KP_LINE_OFF_TEXT_PTR (+16) and
+  //                            KP_LINE_OFF_TEXT_LEN (+24) are read;
+  //                            severity, timestamp, and the reserved
+  //                            growth region are ignored)
+  //   -> rax = 1             match (or empty filter)
+  //   -> rax = 0             no match
+  //
+  // Register plan: pure leaf (no push/pop, no nested call). Every reg
+  // touched is SysV caller-save.
+  //   r8  = filter_ptr        (from [rdi + 0])
+  //   r9  = filter_len        (from [rdi + 8])
+  //   r10 = text_ptr          (from [rsi + 16] per log_line wire)
+  //   r11 = text_len          (from [rsi + 24] per log_line wire)
+  //   rdx = start (outer loop counter, [0..text_len - filter_len])
+  //   rcx = j     (inner loop counter, [0..filter_len))
+  //   rdi, rsi   (repurposed after initial loads as byte-load
+  //                pointers)
+  //   rax        (byte scratch + return value)
+  //
+  // No `lea` emitted -- all pointer math is `mov + add`, so paideia-as's
+  // internal-r11-clobber-on-lea pitfall never bites the text_len value
+  // held in r11 across the loops.
+  //
+  // Labels prefixed vf_mt_ per fingerprint discipline.
+  // ==========================================================================
+  pub let view_filter_match : (u64, u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) (log_line_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-dmesg.M3-001 (postui-dmesg#3): naive strstr predicate over one log_line record. Contract SysV rdi=state_ptr, rsi=log_line_ptr, -> rax in {0, 1}. Pure leaf: no push/pop, no nested call, all working regs SysV caller-save (r8 filter_ptr, r9 filter_len, r10 text_ptr, r11 text_len, rdx start, rcx j, rdi/rsi repurposed as byte-load ptrs post initial reads, rax byte + return scratch). Phase A (state + log_line loads): mov r8, [rdi+0] (filter_ptr per VF_OFF_FILTER_PTR); mov r9, [rdi+8] (filter_len per VF_OFF_FILTER_LEN); mov r10, [rsi+16] (text_ptr per KP_LINE_OFF_TEXT_PTR); mov r11, [rsi+24] (text_len per KP_LINE_OFF_TEXT_LEN). Phase B (empty-filter shortcut): cmp r9, 0; je vf_mt_match (return 1). This lets the frame composer invoke this predicate unconditionally in its per-line loop; the `is the filter armed` branch stays cheap. Phase C (bound check): cmp r11, r9; jb vf_mt_nomatch (text_len < filter_len -> no embedding possible -> return 0). Phase D (outer loop): xor rdx, rdx (start = 0). vf_mt_outer: check (start + filter_len) <= text_len via mov rax, rdx; add rax, r9; cmp rax, r11; ja vf_mt_nomatch (start + filter_len > text_len -> no more valid start positions -> return 0). Phase E (inner loop): xor rcx, rcx (j = 0). vf_mt_inner: cmp rcx, r9; jae vf_mt_match (j == filter_len -> full match -> return 1). Load text[start+j]: mov rax, r10; add rax, rdx; add rax, rcx; xor rdi, rdi; mov_b rdi, [rax+0]. Load filter[j]: mov rax, r8; add rax, rcx; xor rsi, rsi; mov_b rsi, [rax+0]. Compare: cmp rdi, rsi; jne vf_mt_advance (byte mismatch -> advance start). add rcx, 1; jmp vf_mt_inner. vf_mt_advance: add rdx, 1; jmp vf_mt_outer. vf_mt_match: mov rax, 1; ret. vf_mt_nomatch: xor rax, rax; ret. Encoder discipline: no `test` (every zero-check via cmp reg, 0 / cmp reg, reg); no imul (all pointer math via add reg, reg); no `and reg, imm64` (no masks needed -- the low-8 zero-extension is handled by the byte-load prefix xor); no `cmp reg, [mem]` (byte loads land in rdi/rsi first, then cmp rdi, rsi is register-only); no `mul` mnemonic. Every immediate (0, 1, 8, 16, 24) fits imm8. Byte loads use the `xor reg, reg; mov_b reg, [ptr]` shape per the byte-load-zero-then-mov_b compliance flag; rdi and rsi are the destinations (both SysV caller-save; original values consumed at Phase A). Zero pushes/zero pops (pure leaf, no callee-save touched, no nested call). No `lea` in this body -- all pointer math is `mov + add`, so paideia-as's internal-r11-clobber-on-lea pitfall never bites r11 (text_len) which lives across both loops. Labels prefixed vf_mt_ per postui-dmesg fingerprint discipline (substring `loop` avoided: vf_mt_outer / vf_mt_inner / vf_mt_advance / vf_mt_match / vf_mt_nomatch).",
+      block: {
+        // Phase A: load state fields and log_line fields.
+        mov r8,  [rdi + 0];                // filter_ptr
+        mov r9,  [rdi + 8];                // filter_len
+        mov r10, [rsi + 16];               // text_ptr
+        mov r11, [rsi + 24];               // text_len
+
+        // Phase B: empty-filter shortcut -> match.
+        cmp r9, 0;
+        je  vf_mt_match;
+
+        // Phase C: text_len < filter_len -> no possible embedding.
+        cmp r11, r9;
+        jb  vf_mt_nomatch;
+
+        // Phase D: outer loop. start iterates over [0..text_len - filter_len].
+        xor rdx, rdx;                      // start = 0
+
+      vf_mt_outer:
+        // (start + filter_len) > text_len -> no more valid starts.
+        mov rax, rdx;
+        add rax, r9;
+        cmp rax, r11;
+        ja  vf_mt_nomatch;
+
+        // Phase E: inner byte-compare loop.
+        xor rcx, rcx;                      // j = 0
+
+      vf_mt_inner:
+        cmp rcx, r9;
+        jae vf_mt_match;                   // j == filter_len -> full match
+
+        // text[start + j] -> rdi
+        mov rax, r10;
+        add rax, rdx;
+        add rax, rcx;
+        xor rdi, rdi;
+        mov_b rdi, [rax + 0];
+
+        // filter[j] -> rsi
+        mov rax, r8;
+        add rax, rcx;
+        xor rsi, rsi;
+        mov_b rsi, [rax + 0];
+
+        cmp rdi, rsi;
+        jne vf_mt_advance;
+
+        add rcx, 1;
+        jmp vf_mt_inner;
+
+      vf_mt_advance:
+        add rdx, 1;
+        jmp vf_mt_outer;
+
+      vf_mt_match:
+        mov rax, 1;
+        ret;
+
+      vf_mt_nomatch:
+        xor rax, rax;
+        ret
+      }
+    }
+
+}
