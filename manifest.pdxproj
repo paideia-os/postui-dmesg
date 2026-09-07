@@ -51,6 +51,7 @@ caps_decl   = caps.decl
 # KlogPoll (see src/klog_poll.pdx §MODULE NAME).
 sources:
   - src/klog_poll.pdx             # M1-001: KlogState + klog_poll_init + klog_poll_tick KIND_DMESG consumer
+  - src/view_list.pdx             # M2-001: ViewList adapter (log_line -> Line+Span) + auto-scroll List render
 
 # --- Library dependencies -----------------------------------------------
 # postui (the widget library at ../postui, v1.0.0 shipped at

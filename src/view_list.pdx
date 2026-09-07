@@ -1,0 +1,508 @@
+// src/view_list.pdx -- postui-dmesg.M2-001 (paideia-os/postui-dmesg#2)
+//
+// ViewList module: adapt the KlogPoll log_line ring into a postui List
+// widget draw, with auto-scroll-to-bottom that keeps the latest lines
+// on screen every frame.
+//
+// =============================================================================
+// SCOPE (postui/docs/design.md §3.3 postui-dmesg reference app, M2-001 slot)
+// =============================================================================
+//
+// M1-001 landed src/klog_poll.pdx: a KlogState struct + fixed-tick
+// sys_dmesg poller populating an in-memory ring of 256-byte log_line
+// records (each carrying a text_ptr / text_len pair pointing into the
+// module's own _kp_text backing store). This landing wires that ring
+// into a postui List widget draw.
+//
+// Every per-frame call to view_list_render(klog_state_ptr, buf, rows,
+// cols) performs a fixed sequence of phases:
+//
+//   Phase 1 (adapt)      : Walk log_lines[0..effective_count) and
+//                          convert each record into a (Line, Span)
+//                          pair inside this module's static _vl_items
+//                          / _vl_spans arrays. Each log_line becomes
+//                          exactly one 24-byte postui Line whose sole
+//                          Span points at the log_line's text_ptr /
+//                          text_len run (style = 0 = default). This is
+//                          the "adapter" step -- the postui List
+//                          widget's items_ptr expects an array of Line
+//                          structs, and KlogPoll's ring holds 256-byte
+//                          log_line records that share NO layout with
+//                          Text::Line. Copying the two 8-byte fields
+//                          into fresh Line/Span slots is cheaper than
+//                          adding an alternative items array shape to
+//                          the List widget itself.
+//
+//   Phase 2 (scroll)     : Compute the auto-scroll offset that keeps
+//                          the LATEST log lines visible in the rows-
+//                          tall viewport:
+//
+//                              offset = max(0, effective_count - rows)
+//
+//                          When effective_count <= rows: offset = 0
+//                          (every line fits; nothing to scroll). When
+//                          effective_count > rows: offset points at
+//                          the first line of the tail slice, so that
+//                          rows [offset, offset + rows) covers the
+//                          last `rows` entries -- exactly the tail-
+//                          follow shape a live-tailing /bin/dmesg
+//                          expects. Stored into _vl_list_state.offset
+//                          on every frame (selected stays fixed at
+//                          LIST_SELECTED_NONE at M2-001; the M2-004
+//                          keyboard-driven cursor landing will start
+//                          mutating it).
+//
+//   Phase 3 (spec)       : Build a 64-byte ListSpec on the stack
+//                          (rect covers the full canvas, items_ptr =
+//                          _vl_items, item_count = effective_count,
+//                          state_ptr = _vl_list_state, both style
+//                          words = 0 = default). Stack allocation
+//                          (rather than a static _vl_spec) keeps the
+//                          rect field re-derived from the caller-
+//                          supplied (rows, cols) every frame, so a
+//                          SIGWINCH-driven resize is picked up on the
+//                          next call with no extra bookkeeping.
+//
+//   Phase 4 (dispatch)   : Bare call list_draw(spec_ptr, buf, rows,
+//                          cols). Return list_draw's rax verbatim
+//                          (always 0=OK at postui.M2-005 per
+//                          postui/src/widgets/list.pdx §LST_ERR_BAND).
+//
+// =============================================================================
+// ADAPTER APPROACH -- WHY LINE+SPAN, WHY NOT REUSE LOG_LINE
+// =============================================================================
+//
+// KlogPoll's log_line record (klog_poll.pdx §log_line layout) and
+// postui's Text::Line (postui/src/text.pdx §LINE WIRE) are two
+// DIFFERENT 24-byte-prefix shapes with different field semantics:
+//
+//   log_line (256 B)                    Text::Line (24 B)
+//   ---------------                     -----------------
+//   [+ 0]  severity     (u64)           [+ 0]  spans_ptr    (u64)
+//   [+ 8]  timestamp_ns (u64)           [+ 8]  span_count   (u64)
+//   [+16]  text_ptr     (u64)           [+16]  alignment    (u64)
+//   [+24]  text_len     (u64)
+//   [+32..]  reserved growth region
+//
+// The two shapes cannot be aliased -- postui's list_draw indexes
+// items_ptr by TEXT_LINE_BYTES=24, not LINE_BYTES=256, and expects a
+// spans_ptr at [+0] rather than a severity byte. A "just cast the
+// pointer" shortcut would send list_draw walking severity/timestamp
+// words as if they were span array bases -- undefined memory reads.
+//
+// The cheapest bridge is a fixed static staging buffer:
+//
+//   _vl_spans[64]   : one Text::Span per possible visible log_line;
+//                     each Span's byte_ptr / byte_len fields are
+//                     REWRITTEN from the log_line's text_ptr / text_len
+//                     at every frame's Phase 1, style word stays 0.
+//   _vl_items[64]   : one Text::Line per possible visible log_line;
+//                     each Line's spans_ptr is FIXED at load time
+//                     (points at the matching _vl_spans[i] slot), only
+//                     the fields that could change (none at M2-001;
+//                     span_count stays 1, alignment stays 0) get re-
+//                     stored per frame for defensive uniformity.
+//
+// One log_line -> one Line -> one Span. Multi-Span lines (e.g. severity-
+// colored prefix + message body) become natural in the M2-002+ landing
+// that parses the klog wire format's `<L>` severity token: that landing
+// simply overwrites _vl_spans[i] with (LINE_TEXT_MAX/N)-byte segments
+// carrying differing style words, keeping the Line's span_count field
+// re-derived per frame.
+//
+// The 64-line ceiling matches KlogPoll's own KP_MAX_LINES (klog_poll.pdx
+// §Line-count ceiling): the log_line ring can hold at most 64 entries,
+// so a 64-slot adapter table is a natural upper bound. Requests for
+// larger caps (line_cap > 64) will render only the first 64 ring
+// positions at this landing -- documented as a KlogPoll defensive-gate
+// item, not a ViewList concern.
+//
+// =============================================================================
+// AUTO-SCROLL FORMULA
+// =============================================================================
+//
+//     offset = max(0, effective_count - rows)
+//
+// where effective_count = min(log_line_count, VL_MAX_LINES=64).
+//
+// This is the canonical tail-follow shape:
+//
+//   effective_count = 0, rows = 30  ->  offset = 0    (empty list)
+//   effective_count = 10, rows = 30 ->  offset = 0    (fits in viewport)
+//   effective_count = 30, rows = 30 ->  offset = 0    (exactly fills viewport)
+//   effective_count = 31, rows = 30 ->  offset = 1    (drop oldest 1)
+//   effective_count = 64, rows = 30 ->  offset = 34   (show lines 34..63)
+//
+// list_draw's row loop then walks item indices [offset, offset + rows),
+// stopping early when it reaches item_count -- so the visible slice is
+// always the "latest rows entries" of the adapted item array.
+//
+// The M2-004 keyboard-driven cursor landing will let the caller opt
+// OUT of auto-scroll (a `pin_bottom` flag on the state that this
+// module respects), letting the user pause the tail at a chosen row.
+// At M2-001 the flag is not read yet -- auto-scroll is unconditional.
+//
+// =============================================================================
+// RING-ORDER SIMPLIFICATION (M2-001 documented gap)
+// =============================================================================
+//
+// KlogPoll's ring wraps at line_cap: once log_line_count == line_cap,
+// the OLDEST live entry sits at ring position `head` (the next slot
+// about to be overwritten), and the newest sits at (head - 1) mod
+// line_cap. A truly tail-follow render should walk positions
+// [head, head+1, ..., head-1 mod line_cap] to present oldest -> newest
+// in ascending array order.
+//
+// At M2-001 view_list_render skips this wrap reorder and reads ring
+// positions [0..effective_count) linearly. Consequences:
+//
+//   Pre-wrap (log_line_count < line_cap): head == log_line_count, so
+//     positions 0..log_line_count-1 are exactly the write order.
+//     Correct as-is.
+//
+//   Post-wrap (log_line_count == line_cap): positions 0..line_cap-1
+//     are shuffled relative to write order; the visible viewport
+//     shows the ring's slot 0..rows-1 rather than the true newest
+//     `rows` entries. Documented gap; fingerprint tests at M2-001
+//     use pre-wrap inputs only.
+//
+// The M2-002 landing that fixes this will replace the raw index i in
+// Phase 1 with `(head + i) mod line_cap` -- a two-instruction change
+// (add + cmp+sub-if-ge for the modular reduction, since line_cap is
+// not necessarily a power of 2). No caller change; adapter buffer
+// layout is unaffected.
+//
+// =============================================================================
+// STATIC SCRATCH FOOTPRINT (BSS, zero-initialised at load)
+// =============================================================================
+//
+//   _vl_items       [u8; 1536]   64 * 24 = VL_MAX_LINES * TEXT_LINE_BYTES
+//   _vl_spans       [u8; 1536]   64 * 24 = VL_MAX_LINES * TEXT_SPAN_BYTES
+//   _vl_list_state  [u8;   24]   LIST_STATE_BYTES
+//
+// Total = 3096 bytes, all @align(8). Every field except _vl_list_state's
+// reserved slot is rewritten in place at every view_list_render call.
+//
+// =============================================================================
+// ENTRY SIGNATURE
+// =============================================================================
+//
+//   view_list_render(klog_state_ptr, buf, rows, cols) -> u64
+//
+//   rdi = klog_state_ptr    VA of a KlogState populated by klog_poll_init /
+//                           klog_poll_tick (128 B at KlogPoll::
+//                           KLOG_STATE_BYTES; fields at KP_OFF_*)
+//   rsi = buf               VA of a `rows * cols` grid of 16-byte Cells
+//                           (postui/src/cell.pdx cell wire)
+//   rdx = rows              terminal row count
+//   rcx = cols              terminal column count
+//   -> rax                  list_draw's return verbatim (0 = OK at v1
+//                           per postui/src/widgets/list.pdx §LST_ERR_BAND;
+//                           a future List validation landing that
+//                           returns LST_ERR_BAND propagates through
+//                           unchanged)
+//
+// =============================================================================
+// SC+ / KERNEL EFFECT SURFACE
+// =============================================================================
+//
+// view_list_render issues NO syscalls itself. It reads through
+// klog_state_ptr (memory), reads log_lines[] (memory), writes into
+// _vl_items / _vl_spans / _vl_list_state (memory) and dispatches
+// list_draw which walks the cell buffer (memory). Effect row `!{mem}`
+// @{} matches list_draw's own effect. No capability gate.
+//
+// =============================================================================
+// MODULE NAME (paideia-as module-basename-pascal invariant)
+// =============================================================================
+//
+// paideia-as's `module-basename-pascal` compliance flag requires the
+// module name to match the file basename PascalCased. File is
+// `view_list.pdx` -> module `ViewList`. External callers reach this
+// surface via the `pub let` names below (VL_* constants + view_list_
+// render entry). Mirrors postui-top/src/view_gauge.pdx's ViewGauge
+// module discipline.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ViewList`) -- matches file
+//     basename view_list.pdx.
+//   - No `test` mnemonic; every zero-check goes through `cmp reg, 0`.
+//   - Every immediate in cmp/and fits imm32 (widest is 0xFFFF for the
+//     rect packing masks). No sentinels > 0x7FFFFFFF are ever placed
+//     in cmp / and operands.
+//   - LIST_SELECTED_NONE (0xFFFF..FF) is composed at runtime via
+//     `xor reg, reg; sub reg, 1` per postui/src/widgets/list.pdx
+//     precedent -- never loaded via a movabs imm64.
+//   - 2-op `imul reg, reg` only. The 24-byte Line/Span stride multiply
+//     stages the immediate through rcx (`mov rcx, 24; imul rax, rcx`),
+//     matching postui/src/widgets/list.pdx L552-L553.
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`
+//     (every compare loads through a scratch first).
+//   - 256-byte log_line stride uses `shl rax, 8` (256 = 2^8, single
+//     shift), matching klog_poll.pdx L492's own row-index-to-slot-
+//     offset math.
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names; every label prefixed `vl_*`
+//     per the postui-dmesg fingerprint discipline. Substring "loop"
+//     avoided defensively (adapter uses `vl_item_top` / `vl_item_done`).
+//   - r11 usage: view_list_render uses r11 only as a per-store scratch
+//     between `lea rN, [rip + label]` emits. paideia-as internally
+//     clobbers r11 across every RIP-relative lea; nothing here relies
+//     on r11 surviving across such an emit (matches view_gauge.pdx's
+//     r11 discipline note).
+//   - SysV push/pop parity: 5-push callee-save prologue (rbx / r12 /
+//     r13 / r14 / r15 = 40 bytes) + `sub rsp, 80` (aligned) -> entry
+//     rsp%16==8, +40==0, +80==0 for the nested `call list_draw`.
+//   - `pub let` single-line declarations only (multiline `pub let =
+//     "..."` is a paideia-as pitfall).
+//   - Cross-module call convention: bare `call list_draw` per the
+//     frame.pdx / text.pdx / view_gauge.pdx precedent (paideia-as's
+//     flat symbol namespace resolves List::list_draw by name without
+//     any module::function prefix).
+
+module ViewList = structure {
+
+  // ==========================================================================
+  // Sizing / structural constants (locked at M2-001 landing).
+  // ==========================================================================
+  pub let VL_MAX_LINES        : u64 = 64    // matches KlogPoll::KP_MAX_LINES
+  pub let VL_LINE_BYTES       : u64 = 24    // Text::TEXT_LINE_BYTES
+  pub let VL_SPAN_BYTES       : u64 = 24    // Text::TEXT_SPAN_BYTES
+  pub let VL_LIST_STATE_BYTES : u64 = 24    // List::LIST_STATE_BYTES
+  pub let VL_LIST_SPEC_BYTES  : u64 = 64    // List::LIST_SPEC_BYTES
+
+  // ==========================================================================
+  // KlogPoll field offsets we depend on (locked at klog_poll.pdx M1-001).
+  // Named here so a downstream reader can trace every displacement back
+  // to KlogPoll::KP_OFF_* without decoding raw numerals.
+  // ==========================================================================
+  pub let VL_KP_OFF_LOG_LINES_PTR    : u64 = 0
+  pub let VL_KP_OFF_LOG_LINE_COUNT   : u64 = 8
+  pub let VL_KP_LINE_OFF_TEXT_PTR    : u64 = 16
+  pub let VL_KP_LINE_OFF_TEXT_LEN    : u64 = 24
+  pub let VL_KP_LINE_STRIDE          : u64 = 256   // KlogPoll::LINE_BYTES
+
+  // ==========================================================================
+  // Text::Line + Text::Span field offsets (postui/src/text.pdx §*_OFF_*).
+  // ==========================================================================
+  pub let VL_LINE_OFF_SPANS_PTR    : u64 = 0
+  pub let VL_LINE_OFF_SPAN_COUNT   : u64 = 8
+  pub let VL_LINE_OFF_ALIGNMENT    : u64 = 16
+  pub let VL_SPAN_OFF_PTR          : u64 = 0
+  pub let VL_SPAN_OFF_BYTE_LEN     : u64 = 8
+  pub let VL_SPAN_OFF_STYLE        : u64 = 16
+
+  // ==========================================================================
+  // List::ListSpec + List::ListState field offsets (postui/src/widgets/
+  // list.pdx §LIST_OFF_* / §LIST_STATE_OFF_*).
+  // ==========================================================================
+  pub let VL_SPEC_OFF_RECT             : u64 = 0
+  pub let VL_SPEC_OFF_RESERVED_A       : u64 = 8
+  pub let VL_SPEC_OFF_ITEMS_PTR        : u64 = 16
+  pub let VL_SPEC_OFF_ITEM_COUNT       : u64 = 24
+  pub let VL_SPEC_OFF_STATE_PTR        : u64 = 32
+  pub let VL_SPEC_OFF_HIGHLIGHT_STYLE  : u64 = 40
+  pub let VL_SPEC_OFF_DEFAULT_STYLE    : u64 = 48
+  pub let VL_SPEC_OFF_RESERVED_B       : u64 = 56
+
+  pub let VL_STATE_OFF_SELECTED : u64 = 0
+  pub let VL_STATE_OFF_OFFSET   : u64 = 8
+  pub let VL_STATE_OFF_RESERVED : u64 = 16
+
+  // ==========================================================================
+  // Static scratch (mutable, .bss, zero-initialised at load).
+  //
+  //   _vl_items       : 64 * 24 = 1536 bytes of Text::Line staging.
+  //   _vl_spans       : 64 * 24 = 1536 bytes of Text::Span staging.
+  //   _vl_list_state  : 24 bytes of List::ListState.
+  //
+  // All @align(8). Rewritten in place per view_list_render call (see
+  // §STATIC SCRATCH FOOTPRINT in module header).
+  // ==========================================================================
+  pub let mut _vl_items      : [u8; 1536] = uninit @align(8)
+  pub let mut _vl_spans      : [u8; 1536] = uninit @align(8)
+  pub let mut _vl_list_state : [u8;   24] = uninit @align(8)
+
+  // ==========================================================================
+  // view_list_render(klog_state_ptr, buf, rows, cols) -> u64
+  //
+  // Per-frame adapt + auto-scroll + list_draw dispatch. See module
+  // preamble §SCOPE for the phase breakdown and §ENTRY SIGNATURE for
+  // the ABI.
+  //
+  // Register plan (5-push callee-save prologue + sub rsp, 80):
+  //   rbx = klog_state_ptr    survives every phase (Phase 1 field loads)
+  //   r12 = log_lines_ptr     survives every phase (Phase 1 stride base)
+  //   r13 = i (loop counter)  Phase 1 only (dead by Phase 2)
+  //   r14 = buf               survives to Phase 4 list_draw dispatch
+  //   r15 = cols              survives to Phase 3 rect pack + Phase 4 dispatch
+  //
+  // Stack layout (80 bytes, rsp%16 stays 0):
+  //   [rsp +  0..+ 64)   ListSpec              Phase 3 build; Phase 4 rdi
+  //   [rsp + 64..+ 72)   rows                  Phase 3 rect + Phase 4 rdx
+  //   [rsp + 72..+ 80)   effective_count       Phase 1 clamp; Phase 2 scroll;
+  //                                              Phase 3 item_count
+  //
+  // Label prefix `vl_` per postui-dmesg fingerprint discipline; substring
+  // "loop" avoided defensively (uses `vl_item_top` / `vl_item_done` /
+  // `vl_count_ok` / `vl_offset_zero` / `vl_offset_set`).
+  // ==========================================================================
+  pub let view_list_render : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (klog_state_ptr: u64) (buf: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-dmesg.M2-001 (postui-dmesg#2): view_list_render walks the KlogPoll log_line ring, adapts each entry into a Text::Line + Text::Span pair in the module's static _vl_items / _vl_spans scratch buffers, computes an auto-scroll offset that keeps the LATEST rows visible (offset = max(0, effective_count - rows)), builds a 64-byte List::ListSpec on the stack, and dispatches List::list_draw. 5-push callee-save prologue (rbx=klog_state_ptr, r12=log_lines_ptr, r13=loop idx, r14=buf, r15=cols) = 40B -> SysV rsp%16==8 + 40 = rsp%16==0. sub rsp, 80 (64B ListSpec + 8B rows stash + 8B effective_count stash) keeps rsp%16==0 for the nested `call list_draw`. Phase 1 (adapt): load log_lines_ptr into r12 from [rbx+0]; load log_line_count into rax from [rbx+8]; clamp effective_count = min(log_line_count, VL_MAX_LINES=64) via cmp rax, 64 (imm8); jbe vl_count_ok; mov rax, 64; vl_count_ok: mov [rsp+72], rax. Loop xor r13, r13 (i=0). vl_item_top: mov rcx, [rsp+72]; cmp r13, rcx; jae vl_item_done. src_line = log_lines_ptr + i * 256 via mov rax, r13; shl rax, 8 (256=2^8, imm8 shift, no imul); add rax, r12. Load text_ptr into r8 from [rax+16] (VL_KP_LINE_OFF_TEXT_PTR); load text_len into r9 from [rax+24]. Compute stride = i * 24 into rax via mov rax, r13; mov rcx, 24; imul rax, rcx (2-op reg,reg, paideia-as-safe). span_slot = _vl_spans + stride into r10 via lea r10, [rip+_vl_spans]; add r10, rax. item_slot = _vl_items + stride into r11 via lea r11, [rip+_vl_items]; add r11, rax. Between the two leas r10 survives (paideia-as's internal RIP-scratch is r11, not r10; matches view_gauge.pdx's own r11 discipline note L157-L162); rax also survives (neither lea writes rax). Populate span: mov [r10+0], r8 (span.ptr=text_ptr); mov [r10+8], r9 (span.byte_len=text_len); xor rax, rax; mov [r10+16], rax (span.style=0). Populate item: mov [r11+0], r10 (item.spans_ptr=span_slot); mov rax, 1; mov [r11+8], rax (item.span_count=1); xor rax, rax; mov [r11+16], rax (item.alignment=0). Advance: add r13, 1; jmp vl_item_top. vl_item_done: (Phase 2, scroll) mov rax, [rsp+72] (effective_count); mov rcx, [rsp+64] (rows); cmp rax, rcx; jbe vl_offset_zero; sub rax, rcx; jmp vl_offset_set; vl_offset_zero: xor rax, rax; vl_offset_set: rax holds new offset. Store into _vl_list_state: lea r10, [rip+_vl_list_state]; selected=LIST_SELECTED_NONE composed via xor rcx, rcx; sub rcx, 1; mov [r10+0], rcx (selected); mov [r10+8], rax (offset); xor rcx, rcx; mov [r10+16], rcx (reserved=0). (Phase 3, spec build) Pack rect (x=0, y=0, w=cols, h=rows) into [rsp+0]: rect = (rows<<48) | (cols<<32) | (0<<16) | 0. mov rax, [rsp+64] (rows); and rax, 0xFFFF (imm32); shl rax, 48; mov rcx, r15 (cols); and rcx, 0xFFFF; shl rcx, 32; or rax, rcx; mov [rsp+0], rax. xor rcx, rcx; mov [rsp+8], rcx (reserved_a=0). lea rax, [rip+_vl_items]; mov [rsp+16], rax (items_ptr). mov rax, [rsp+72]; mov [rsp+24], rax (item_count=effective_count). lea rax, [rip+_vl_list_state]; mov [rsp+32], rax (state_ptr). xor rax, rax; mov [rsp+40], rax (highlight_style=0); mov [rsp+48], rax (default_style=0); mov [rsp+56], rax (reserved_b=0). (Phase 4, dispatch) mov rdi, rsp (ListSpec at rsp+0 -- spec_ptr); mov rsi, r14 (buf); mov rdx, [rsp+64] (rows); mov rcx, r15 (cols); call list_draw. rax carries list_draw's return verbatim (0=OK at v1). Epilogue: add rsp, 80; pop r15/r14/r13/r12/rbx; ret. Encoder discipline: no `test` (all zero-checks via cmp reg, 0 / cmp reg, imm8); no `and reg, imm64` (widest mask 0xFFFF); no 2-op `imul reg, imm` (24-stride via rcx=24, imul rax, rcx; 256-stride via shl rax, 8); no `mul` mnemonic; no `cmp reg, [mem]` (all compares against register-held values loaded via prior mov). Every immediate (0, 1, 8, 16, 24, 32, 48, 56, 64, 72, 80, 0xFFFF) fits imm8/imm32. LIST_SELECTED_NONE composed at runtime via xor+sub 1 rather than movabs imm64. Cross-module call to list_draw is bare `call list_draw` per frame.pdx / view_gauge.pdx precedent (paideia-as flat symbol namespace resolves List::list_draw by name). list_draw's own 5-push prologue preserves SysV callee-save regs (rbx/r12/r13/r14/r15) on every return path per postui/src/widgets/list.pdx L713-L721. Effect !{mem} @{} matches list_draw. r11 usage: only as an intra-loop item_slot base immediately after `lea r11, [rip+_vl_items]`; the paideia-as-internal r11 clobber across each lea is respected (we never rely on r11 surviving another lea). Labels prefixed vl_ per postui-dmesg fingerprint discipline (substring `loop` avoided: vl_item_top / vl_item_done / vl_count_ok / vl_offset_zero / vl_offset_set).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 80;
+
+        // ---- Cache invariants ----------------------------------------------
+        mov rbx, rdi;                              // klog_state_ptr
+        mov r14, rsi;                              // buf
+        mov [rsp + 64], rdx;                       // rows (stash on stack)
+        mov r15, rcx;                              // cols
+
+        // Load log_lines_ptr from KlogState[+0].
+        mov r12, [rbx + 0];                        // log_lines_ptr
+
+        // Clamp effective_count = min(log_line_count, VL_MAX_LINES=64).
+        mov rax, [rbx + 8];                        // log_line_count
+        cmp rax, 64;                               // VL_MAX_LINES (imm8)
+        jbe vl_count_ok;
+        mov rax, 64;
+      vl_count_ok:
+        mov [rsp + 72], rax;                       // effective_count
+
+        // ---- Phase 1: adapt log_lines[0..effective_count) ------------------
+        xor r13, r13;                              // i = 0
+
+      vl_item_top:
+        mov rcx, [rsp + 72];                       // effective_count
+        cmp r13, rcx;
+        jae vl_item_done;
+
+        // src_line = log_lines_ptr + i * 256 (LINE_BYTES = 2^8, shift only).
+        mov rax, r13;
+        shl rax, 8;
+        add rax, r12;
+        // rax = src_line
+
+        // Load log_line.text_ptr, log_line.text_len.
+        mov r8, [rax + 16];                        // text_ptr (KP_LINE_OFF_TEXT_PTR)
+        mov r9, [rax + 24];                        // text_len (KP_LINE_OFF_TEXT_LEN)
+
+        // stride = i * 24 (Line/Span stride; 2-op imul reg,reg via rcx=24)
+        mov rax, r13;
+        mov rcx, 24;
+        imul rax, rcx;
+
+        // span_slot = _vl_spans + stride
+        lea r10, [rip + _vl_spans];
+        add r10, rax;
+
+        // item_slot = _vl_items + stride
+        // (r10 survives this second lea; paideia-as's internal RIP-scratch
+        //  is r11, per view_gauge.pdx §r11 discipline. rax also survives:
+        //  neither lea writes rax.)
+        lea r11, [rip + _vl_items];
+        add r11, rax;
+
+        // Populate _vl_spans[i].
+        mov [r10 + 0],  r8;                        // span.ptr      = text_ptr
+        mov [r10 + 8],  r9;                        // span.byte_len = text_len
+        xor rax, rax;
+        mov [r10 + 16], rax;                       // span.style    = 0
+
+        // Populate _vl_items[i].
+        mov [r11 + 0],  r10;                       // item.spans_ptr = span_slot
+        mov rax, 1;
+        mov [r11 + 8],  rax;                       // item.span_count = 1
+        xor rax, rax;
+        mov [r11 + 16], rax;                       // item.alignment  = 0
+
+        add r13, 1;
+        jmp vl_item_top;
+
+      vl_item_done:
+
+        // ---- Phase 2: auto-scroll offset = max(0, effective_count - rows) --
+        mov rax, [rsp + 72];                       // effective_count
+        mov rcx, [rsp + 64];                       // rows
+        cmp rax, rcx;
+        jbe vl_offset_zero;
+        sub rax, rcx;
+        jmp vl_offset_set;
+      vl_offset_zero:
+        xor rax, rax;
+      vl_offset_set:
+        // rax = new offset
+
+        // Store into _vl_list_state.
+        lea r10, [rip + _vl_list_state];
+        // selected = LIST_SELECTED_NONE (0xFFFF..FF, composed via xor+sub 1
+        // rather than a movabs imm64, per List::LIST_SELECTED_NONE
+        // discipline).
+        xor rcx, rcx;
+        sub rcx, 1;
+        mov [r10 + 0],  rcx;                       // selected
+        mov [r10 + 8],  rax;                       // offset
+        xor rcx, rcx;
+        mov [r10 + 16], rcx;                       // reserved = 0
+
+        // ---- Phase 3: build ListSpec on stack ------------------------------
+        // rect = (rows << 48) | (cols << 32) | (0 << 16) | 0
+        mov rax, [rsp + 64];                       // rows
+        and rax, 0xFFFF;
+        shl rax, 48;                               // h << 48
+        mov rcx, r15;                              // cols
+        and rcx, 0xFFFF;
+        shl rcx, 32;                               // w << 32
+        or  rax, rcx;
+        mov [rsp + 0],  rax;                       // rect
+
+        xor rcx, rcx;
+        mov [rsp + 8],  rcx;                       // reserved_a = 0
+
+        // items_ptr = &_vl_items[0]
+        lea rax, [rip + _vl_items];
+        mov [rsp + 16], rax;
+
+        // item_count = effective_count
+        mov rax, [rsp + 72];
+        mov [rsp + 24], rax;
+
+        // state_ptr = &_vl_list_state
+        lea rax, [rip + _vl_list_state];
+        mov [rsp + 32], rax;
+
+        // highlight_style = 0, default_style = 0, reserved_b = 0
+        xor rax, rax;
+        mov [rsp + 40], rax;
+        mov [rsp + 48], rax;
+        mov [rsp + 56], rax;
+
+        // ---- Phase 4: call list_draw(spec, buf, rows, cols) ----------------
+        mov rdi, rsp;                              // spec_ptr = &ListSpec
+        mov rsi, r14;                              // buf
+        mov rdx, [rsp + 64];                       // rows
+        mov rcx, r15;                              // cols
+        call list_draw;
+
+        // rax carries list_draw's return verbatim (0 = OK at v1).
+        add rsp, 80;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+}
