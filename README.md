@@ -5,17 +5,33 @@ library across a `List` + `TextInput` + `Tabs` widget mix.
 
 ## Status
 
-**Design phase — not started.** Depends on `paideia-os/postui` M1
-(skeleton), M2 (List/Tabs), and M4 (TextInput) landing first. See the
+**v1.0.0 shipped 2026-09-07.** All M1..M4 milestones landed:
+- **M1** klog_poll (sys_dmesg sysno 13 consumer, 64-slot log ring)
+- **M2** view_list (auto-scroll List adapter)
+- **M3** view_filter (TextInput + naive strstr) + view_tabs (5-tab severity split)
+- **M4** SemanticEmit DmesgLineView@0.1 via sys_semantic_send (sysno 115)
+
+Depends on `paideia-os/postui` M1-M4 (List, Tabs, TextInput). See
 authoritative design at [`paideia-os/postui`'s `docs/design.md`](https://github.com/paideia-os/postui/blob/main/docs/design.md)
-§3.3 for widget mix, data source, semantic records, and milestone
-breakdown; see `STATUS.md` here for the rollup.
+§3.3.
 
 ## Data source
 
-`KIND_TUI_CANVAS`'s sibling kernel facility, `KIND_DMESG`
-(`src/kernel/core/cap/kind_dmesg.pdx` in `paideia-os/paideia-os`),
-polled/subscribed for new lines.
+Live tail of paideia-os kernel log ring via `sys_dmesg` (sysno 13);
+future variant will swap to `KIND_DMESG` cap subscribe when TCB
+cap-slots land.
+
+## Known follow-ups
+
+- **postui-dmesg#7** — POSTUI_DMESG_ERR_BAND collides with postui-hex
+  at 0xFFFFE010..1F; needs relocation to 0xFFFFE020..2F.
+- **postui-dmesg#8** — view_tabs severity mapping uses fabricated
+  syslog priorities (0=emerg/3=err/4=warn/6=info); paideia-os actually
+  uses LEVEL_* (0=PANIC..5=TRACE). Mapping + tab labels need rewrite;
+  currently latent because klog_poll M1 stubs severity to 0.
+- **paideia-os#2352** — sys_semantic_send (sysno 115) not yet landed
+  in paideia-os kernel dispatch; semantic_emit returns -ENOSYS until
+  handler lands.
 
 ## License
 

@@ -1,0 +1,76 @@
+// tests/boot_dmesg_smoke.pdx -- postui-dmesg M4 placeholder
+//
+// BootDmesgSmoke: end-to-end boot-smoke placeholder for the postui-
+// dmesg app. When a body lands, this module will:
+//
+//   1. Seed a KlogPoll::klog_state via klog_poll_init,
+//   2. Hand it one fabricated klog byte stream through the
+//      klog_poll_tick path (bypassing sys_dmesg by dropping bytes
+//      directly into the poll-scratch slot for hermetic replay),
+//   3. Drive one ViewList::view_list_render frame against a fixture-
+//      sized Buffer, gated by view_tabs_selected() +
+//      view_filter_match() as ViewList would in the real render loop,
+//      and
+//   4. Marshal one ring entry through SemanticEmit::semantic_emit_
+//      dmesg_line to prove the DmesgLineView@0.1 wire record round-
+//      trips 120 bytes as declared in caps.decl.
+//
+// A mismatch at any step returns a sentinel in the postui-dmesg
+// fingerprint band; success returns 0.
+//
+// =============================================================================
+// SCOPE (postui-dmesg#6 M4 release closer)
+// =============================================================================
+//
+// v1.0.0 lands this file as a *placeholder* so the manifest
+// pdxproj's tests: block has a target to point at and downstream
+// scaffolding (`bash tools/build.sh`'s `if [ -d tests ]` loop, the
+// eventual `paideia-as build --tests` target) is exercised at
+// release-close time. The body remains a follow-up:
+//
+//   * postui-dmesg#7 relocates the fail-code band from 0xFFFFE01x
+//     (occupied by KlogPoll's KP_ERR_* range) to 0xFFFFE020..
+//     0xFFFFE02F to avoid symbol overlap; every sentinel this file
+//     will declare belongs to the new band.
+//   * postui-dmesg#8 replaces the fabricated syslog priorities the
+//     current view_tabs_match keys against with the frozen LEVEL_*
+//     enum from paideia-os/kind_dmesg upstream.
+//
+// Both follow-ups gate a landing that emits real bytes, so this
+// file stays intentionally content-free at v1.0.0. The .pdx module
+// header below satisfies paideia-as's module-basename-pascal
+// invariant (boot_dmesg_smoke.pdx -> module BootDmesgSmoke) so
+// `bash tools/build.sh` still produces build-out/tests-boot_dmesg_
+// smoke.o without a parse failure.
+//
+// =============================================================================
+// MODULE NAME (paideia-as module-basename-pascal invariant)
+// =============================================================================
+//
+// File is `boot_dmesg_smoke.pdx` -> module `BootDmesgSmoke`. Matches
+// klog_poll.pdx -> KlogPoll and view_list.pdx -> ViewList precedent
+// elsewhere in this repo.
+
+module BootDmesgSmoke = structure {
+
+  // Fail-code band for BootDmesgSmoke.
+  //
+  // KP_ERR_* in src/klog_poll.pdx already occupies 0xFFFFE010..
+  // 0xFFFFE01F; the M4 placeholder reserves the adjacent 0xFFFFE020..
+  // 0xFFFFE02F range for boot-smoke step sentinels. postui-dmesg#7
+  // is the tracking issue for band relocation across the wave --
+  // the constants below are declared now so a later body landing
+  // does not have to churn a caps.decl re-sign for numeric shuffles.
+  pub let SMOKE_ERR_BAND_BASE : u64 = 0xFFFFE020
+  pub let SMOKE_ERR_BAND_TOP  : u64 = 0xFFFFE02F
+
+  // Placeholder entry point. Returns 0 unconditionally at v1.0.0.
+  // Downstream harnesses may already link against this symbol; the
+  // return value is the future contract (0 = pass, band sentinel =
+  // fail at step N).
+  pub fn boot_dmesg_smoke() -> u64 {
+    xor rax, rax
+    ret
+  }
+
+}

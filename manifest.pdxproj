@@ -31,7 +31,7 @@
 # same monorepo-satellite pattern (postui-top#1 M1-001).
 
 name        = postui-dmesg
-version     = 0.1.0-pre
+version     = 1.0.0
 kind        = tool
 # entry lands at M1-005 (_start binder + main render loop). At M1-001
 # there is no _start; the loose-object build via tools/build.sh
