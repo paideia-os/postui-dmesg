@@ -1,0 +1,500 @@
+// src/semantic_emit.pdx -- postui-dmesg.M3-003 (paideia-os/postui-dmesg#5)
+//
+// SemanticEmit module: DmesgLineView@0.1 wire-record marshaller +
+// sys_semantic_send emitter.
+//
+// =============================================================================
+// SCOPE (paideia-os/postui-dmesg#5 M3-003)
+// =============================================================================
+//
+// The M3-003 landing wires postui-dmesg's outbound semantic-pipe
+// path. KlogPoll (M1-001) parses klog bytes into an in-memory 256B
+// log_line ring; ViewList / ViewTabs / ViewFilter (M2 / M3-001 /
+// M3-002) render the ring on the canvas; this module walks the
+// remaining hop: pack one log_line into a fixed 120B wire record
+// (DmesgLineView@0.1) and hand it to the kernel via sys_semantic_send
+// (SC+ sysno 115; paideia-os#2350 landed the kernel body at commit
+// 71a15fb).
+//
+// The M4 packaging landing (post-M3) enumerates DmesgLineView@0.1 in
+// the release manifest's schema-registry submission and turns on the
+// per-poll auto-emit hook inside KlogPoll's tick loop. At M3-003 the
+// emit surface is CALLABLE but not yet wired into the tick path --
+// the wiring lands with M4-001 (schema-registry submission) +
+// M4-002 (auto-emit hook). Wiring the two landings separately keeps
+// the M3-003 diff bisectable: a caller of semantic_emit_dmesg_line
+// can exercise the marshalling + syscall path in isolation before
+// the ring-refresh loop drives it.
+//
+// =============================================================================
+// MODULE NAME (paideia-as module-basename-pascal invariant)
+// =============================================================================
+//
+// paideia-as's `module-basename-pascal` compliance flag
+// (manifest.pdxproj `compliance` block) requires the module name to
+// match the file basename PascalCased. File is `semantic_emit.pdx`
+// -> module `SemanticEmit`. Matches klog_poll.pdx -> KlogPoll and
+// view_list.pdx -> ViewList precedent.
+//
+// =============================================================================
+// SCHEMA HASH (0xE020000144C56501)
+// =============================================================================
+//
+// DmesgLineView@0.1 is the postui-dmesg-owned schema declared in
+// caps.decl's `declares_output_schemas` block. Its schema hash is a
+// 64-bit constant computed offline from the schema tuple (namespace,
+// version, name). PaideiaOS's canonical schema-hash primitive
+// (BLAKE3-truncated-to-64-bits per libpdx-semantic-pipe v1) is still
+// stubbed pending BLAKE3 landing in paideia-as; the placeholder
+// value below decomposes as:
+//
+//   0xE020_0001_44C56501
+//   ^^^^ ^^^^ ^^^^^^^^^^
+//   |    |    |
+//   |    |    +--- schema-name discriminator "DmesgLineView" tag
+//   |    +-------- schema version 1 (16-bit)
+//   +------------- postui-dmesg namespace band (postui satellites
+//                  own 0xE010..0xE0FF; postui itself takes 0xE000,
+//                  postui-top 0xE010, postui-dmesg 0xE020,
+//                  postui-hex 0xE030 -- one page per satellite)
+//
+// When the real BLAKE3-based hash lands (paideia-as blake3_hash32
+// intrinsic; RELEASE-NOTES-v0.20.md tracks the deferred Class-A
+// blocker), this constant flips to the true BLAKE3("DmesgLineView@
+// 0.1") truncated to 64 bits. The flip is WIRE-BREAKING for any
+// subscriber that already registered on the placeholder value, but
+// no live subscriber exists at M3-003 -- the schema-registry
+// submission lands at M4-001. Documented here so the M4 flip does
+// not surprise a bisection walker.
+//
+// The 64-bit value fits nowhere but movabs (10-byte encoding), so
+// every load of DMESG_LINE_VIEW_SCHEMA_HASH emits as `mov reg,
+// imm64`. This is legal for `mov reg, imm` but NOT for `cmp reg,
+// imm` or `and reg, imm` (paideia-as's imm32 ceiling applies to
+// those forms) -- see the encoder-pitfalls list documented in
+// klog_poll.pdx §PAIDEIA-AS CONFORMANCE.
+//
+// =============================================================================
+// DMESGLINEVIEW WIRE RECORD (120 bytes; sys_semantic_send record_len)
+// =============================================================================
+//
+// The wire record is a fixed 120-byte layout the kernel copies
+// verbatim into the endpoint's ring buffer. sys_semantic_send's
+// record_len ABI parameter is bounded at [1, 240]; 120 sits well
+// under the ceiling and leaves room for future schema revisions
+// (v0.2 CPU / subsystem tokens, v0.3 dedup counter) without a wire
+// format change.
+//
+//   [+0]    severity     (u64)     Copied verbatim from log_line[+0].
+//                                  KlogPoll M1-001 emits 0 (parser
+//                                  placeholder); KlogPoll M2 will
+//                                  emit the parsed klog level nibble
+//                                  once level extraction lands.
+//                                  Range at M3-003: {0}; range at
+//                                  KlogPoll M2 close: {0..7} per
+//                                  design/kernel/kernel-logging-
+//                                  substrate.md §6.2 <L> token.
+//   [+8]    timestamp_ns (u64)     Copied verbatim from log_line[+8].
+//                                  Poll-tick snapshot (Phase A of
+//                                  KlogPoll::klog_poll_tick), NOT
+//                                  the per-line TSC embedded in the
+//                                  klog wire format. Monotonic.
+//   [+16]   text_bytes   (u8[96])  Inline copy of the first 96 bytes
+//                                  of the log line text (log_line[
+//                                  +16] dereferences to text_ptr;
+//                                  we copy up to min(text_len, 96)
+//                                  bytes from there). Truncated at
+//                                  the byte boundary -- NO
+//                                  attempt to preserve UTF-8
+//                                  codepoint alignment at truncation
+//                                  (a mid-codepoint truncation
+//                                  emits a partial sequence the
+//                                  subscriber must handle; per
+//                                  libpdx-semantic-pipe v1 §wire-
+//                                  format, the reader is expected
+//                                  to reference text_len below to
+//                                  detect truncation and re-fetch
+//                                  the full line via a separate
+//                                  DmesgLineFullView@0.1 stream if
+//                                  needed -- a future M4-003 issue
+//                                  will land the full-view schema).
+//                                  Bytes past min_len are zero-
+//                                  filled so the wire record has
+//                                  deterministic bytes end-to-end
+//                                  (subscribers snapshotting the
+//                                  record for signing / dedup see
+//                                  stable content regardless of
+//                                  prior emit state).
+//   [+112]  text_len     (u64)     Original text_len from log_line[
+//                                  +24], BEFORE truncation. A
+//                                  subscriber compares against 96
+//                                  to detect truncation.
+//
+//   Total = 8 + 8 + 96 + 8 = 120 bytes.
+//
+// Layout offsets are named as `DLV_OFF_*` so a subscriber can
+// pattern-match against them rather than tracking magic literals.
+// Matches the SEM_BINDING_OFF_* / KP_LINE_OFF_* discipline every
+// other postui module already establishes.
+//
+// =============================================================================
+// TRUNCATION STRATEGY
+// =============================================================================
+//
+// text_len > 96: The wire record's text_bytes[] contains the first
+// 96 bytes of the source line; the remaining (text_len - 96) bytes
+// are DROPPED from the wire record. text_len at +112 preserves the
+// original length, so a subscriber can detect the truncation
+// (text_len > 96) and either accept the partial view or request a
+// full-view refetch (per §DMESGLINEVIEW WIRE RECORD note above).
+//
+// text_len <= 96: The full line fits inline. text_bytes[0..text_len]
+// carries the line bytes; text_bytes[text_len..96] is zero-filled.
+// text_len at +112 equals the copied count.
+//
+// text_len == 0: No source bytes copied; text_bytes[0..96] fully
+// zero-filled; text_len at +112 = 0. The record is still a valid
+// DmesgLineView@0.1 (severity + timestamp remain meaningful; a
+// subscriber that only tracks per-severity counters keeps working
+// on empty lines).
+//
+// Zero-fill is UNCONDITIONAL over the full [+16..+112) range
+// regardless of min_len: the body zeroes all 96 text_bytes bytes
+// FIRST, then overwrites the leading min_len bytes with the source.
+// This costs 12 qword stores per emit but keeps the byte-copy loop
+// register-simple (no need to track min_len across the two loops)
+// and eliminates the class of bugs where a partial residual from a
+// prior emit leaks into a shorter follow-up record. Encoder-cheap:
+// each qword store is a 7-byte `mov [rbx + imm8], rax` encoding.
+//
+// =============================================================================
+// BYTE-COPY LOOP DISCIPLINE
+// =============================================================================
+//
+// The min(text_len, 96) copy loop follows KlogPoll::kp_write_line's
+// own byte-copy shape (klog_poll.pdx L505-514):
+//
+//   se_copy_step:
+//     cmp rcx, 0;          // count exhausted?
+//     je se_copy_done;
+//     xor r8, r8;          // zero r8 fully before mov_b (mov_b does
+//                          //   NOT zero-extend on its own, per
+//                          //   klog_poll.pdx §byte-load-zero-then-
+//                          //   mov_b compliance flag)
+//     mov_b r8, [rax];     // load one byte, src cursor
+//     mov_b [rdx], r8;     // store one byte, dst cursor
+//     add rax, 1;
+//     add rdx, 1;
+//     sub rcx, 1;
+//     jmp se_copy_step;
+//   se_copy_done:
+//
+// rax / rcx / rdx / r8 are all SysV caller-save. The dst cursor
+// (rdx) advances past +112's field boundary only when min_len = 96,
+// at which point the loop terminates on `cmp rcx, 0` before the
+// store. No overrun into text_len's +112 slot.
+//
+// =============================================================================
+// SYSCALL WRAPPER (se_sys_semantic_send)
+// =============================================================================
+//
+// Modeled on KlogPoll::kp_sys_dmesg (klog_poll.pdx L410-419): thin
+// leaf wrapper that loads the SC+ sysno into rax and dispatches
+// SYSCALL. The three SysV arg registers (rdi=schema_hash, rsi=
+// record_ptr, rdx=record_len) map identically to the first three
+// SYSCALL arg registers, so no register shuffle is needed
+// (contrast tcc_resize in postui/src/tui_canvas_client.pdx which
+// needs r10<-rcx staging at arity 4). sysno 115 fits imm32-signed-
+// positive so `mov rax, 115` emits the compact 5-byte form. Rcx
+// and r11 are SYSCALL-clobbered (SysV caller-save on both sides).
+//
+// Effect row `!{sysreg}` covers the syscall entry; NOT `!{mem}`
+// because the wrapper itself performs no user-space store. The
+// kernel path DOES read the caller's record buffer, but that effect
+// is downstream of the syscall boundary and libpdx-semantic-pipe
+// v1's contract already annotates that side; the wrapper's !{sysreg}
+// captures the boundary crossing.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (identical set to klog_poll.pdx's)
+// =============================================================================
+//
+//   - Module name PascalCase basename (`SemanticEmit`), matches file
+//     basename semantic_emit.pdx.
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every immediate in cmp / and fits imm32 (<= 0x7FFFFFFF). The
+//     large schema-hash constant 0xE020000144C56501 appears ONLY in
+//     `mov reg, imm` form (movabs 10-byte encoding) -- never as a
+//     cmp / and immediate.
+//   - No 2-op `imul reg, imm` anywhere; no imul used at all.
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`.
+//   - r11 is scratch (paideia-as reserved). Nothing here writes r11
+//     with a value expected to survive a nested call; the syscall
+//     itself SYSCALL-clobbers rcx + r11.
+//   - `xor reg, reg; mov_b reg, [ptr]` shape for every byte load;
+//     `mov_b [ptr], reg` for byte store (mirrors kernel core/
+//     drivers/nvme/mdts.pdx L136 + core/acpi/gpe_io.pdx L374,
+//     matching KlogPoll::kp_write_line's own byte-copy loop).
+//   - Every function that issues a nested call pushes an ODD count
+//     of 8-byte callee-save registers so `rsp % 16 == 0` at the
+//     call boundary. semantic_emit_dmesg_line: 3 pushes (rbx, r12,
+//     r13) = 24 B; SysV entry rsp%16==8 + 24 = rsp%16==0.
+//     se_sys_semantic_send: leaf, no pushes, no nested calls.
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names. Every label prefixed
+//     `se_` (semantic-emit). Substring "loop" avoided defensively
+//     (labels use `_step_` / `_done_` / `_ok_`).
+//   - `pub let` single-line declarations only (multiline `pub let
+//     ="..."` is a paideia-as pitfall).
+
+module SemanticEmit = structure {
+
+  // ==========================================================================
+  // Schema hash. See §SCHEMA HASH (0xE020000144C56501) above for the
+  // decomposition and the M4-001 BLAKE3 flip note.
+  // ==========================================================================
+  pub let DMESG_LINE_VIEW_SCHEMA_HASH : u64 = 0xE020000144C56501
+
+  // ==========================================================================
+  // Wire record byte count. sys_semantic_send's record_len ABI
+  // parameter is bounded at [1, 240] (paideia-os#2350 kernel body
+  // gates this); 120 sits well under the ceiling.
+  // ==========================================================================
+  pub let DLV_RECORD_BYTES : u64 = 120
+
+  // ==========================================================================
+  // Wire record layout offsets. Named so a subscriber can decode by
+  // symbol rather than magic literal. See §DMESGLINEVIEW WIRE RECORD
+  // above for the semantic per-field description.
+  // ==========================================================================
+  pub let DLV_OFF_SEVERITY     : u64 = 0
+  pub let DLV_OFF_TIMESTAMP_NS : u64 = 8
+  pub let DLV_OFF_TEXT_BYTES   : u64 = 16
+  pub let DLV_OFF_TEXT_LEN     : u64 = 112
+
+  // ==========================================================================
+  // Inline text_bytes capacity. Bytes past this cap in the source
+  // line are dropped from the wire record (text_len at +112
+  // preserves the original length so a subscriber can detect
+  // truncation). See §TRUNCATION STRATEGY above.
+  // ==========================================================================
+  pub let DLV_TEXT_BYTES_MAX : u64 = 96
+
+  // ==========================================================================
+  // SC+ sysno constant. sys_semantic_send at sysno 115 lands the
+  // kernel body at paideia-os#2350 (commit 71a15fb, R90-XREPO).
+  // Named locally so se_sys_semantic_send names the SC+ ID in
+  // exactly one place; matches KlogPoll's KP_SYS_* discipline.
+  // ==========================================================================
+  pub let SE_SYS_SEMANTIC_SEND : u64 = 115
+
+  // ==========================================================================
+  // Scratch storage. _se_scratch is a single 120-byte staging area
+  // for the wire record. semantic_emit_dmesg_line packs the record
+  // in place, then hands the pointer to sys_semantic_send (which
+  // copies the bytes into the endpoint ring). Lives in .bss (zero-
+  // initialized at load); overwritten per-emit. Aligned to 8 so the
+  // qword zero-fill loop's stores hit natural alignment.
+  //
+  // Single-threaded userspace app; concurrent emits from disjoint
+  // callers are not a concern at M3-003 (KlogPoll is the sole
+  // caller pattern once the M4-002 auto-emit hook lands, and it
+  // runs from the app's main tick loop -- one refresh at a time).
+  // A future multi-emitter landing would replace _se_scratch with a
+  // per-caller scratch parameter; the current shape matches
+  // KlogPoll's _kp_dmesg_scratch precedent.
+  // ==========================================================================
+  pub let mut _se_scratch : [u8; 120] = uninit @align(8)
+
+  // ==========================================================================
+  // se_sys_semantic_send(schema_hash, record_ptr, record_len) -> u64
+  //
+  // Thin wrapper around SC+ sysno 115 (sys_semantic_send). Emits one
+  // schema-typed record to the caller's bound semantic-pipe endpoint.
+  // Returns 0 on success or a negative errno-shaped sentinel on
+  // failure (see paideia-os#2350 for the failure taxonomy; the
+  // wrapper passes the return through unchanged).
+  //
+  // Contract:
+  //   rdi = schema_hash    u64 schema identifier (typically
+  //                        DMESG_LINE_VIEW_SCHEMA_HASH here)
+  //   rsi = record_ptr     VA of a record_len-byte record
+  //   rdx = record_len     u64 record byte count, must be in [1, 240]
+  //                        per paideia-os#2350 kernel gate
+  //   -> rax = 0            success
+  //   -> rax < 0            failure (kernel-side sentinel; wrapper
+  //                        does not translate)
+  //
+  // SysV rdi/rsi/rdx -> SYSCALL rdi/rsi/rdx (no shuffle; arity 3 < 4
+  // so r10 substitution for rcx is not triggered). Leaf.
+  //
+  // Effect row `!{sysreg}` matches postui::SemanticRegistry::
+  // semantic_send's own posture (postui/src/semantic_registry.pdx
+  // L236). NOT `!{mem}` -- the wrapper itself does not store to
+  // userspace memory; the kernel path's read of record_ptr's bytes
+  // is downstream of the syscall boundary.
+  // ==========================================================================
+  pub let se_sys_semantic_send : (u64, u64, u64) -> u64 !{sysreg} @{} =
+    fn (schema_hash: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "postui-dmesg.M3-003 (postui-dmesg#5): SC+ sysno 115 (sys_semantic_send) wrapper. SysV rdi=schema_hash / rsi=record_ptr / rdx=record_len pass through unchanged to SYSCALL rdi/rsi/rdx (arity 3 -- SYSCALL's r10-replaces-rcx substitution at arity 4 is not triggered). Body: mov rax, 115; syscall; ret. Kernel body landed at paideia-os#2350 (commit 71a15fb, R90-XREPO) gates record_len at [1, 240] and enqueues the copy onto the caller's bound endpoint ring. Return value: 0 on success or a negative errno-shaped sentinel; wrapper passes through unchanged. Sysno 115 fits imm32-signed-positive (< 0x7FFFFFFF), so `mov rax, 115` emits the compact 5-byte `mov r32, imm32` form (not the 10-byte movabs). Leaf: rcx/r11 SYSCALL-clobbered (SysV caller-save). No callee-save touched, no push/pop, no memory access on our side. Effect row !{sysreg} matches postui::SemanticRegistry::semantic_send's own posture at postui/src/semantic_registry.pdx L236. Sole consumer at M3-003: semantic_emit_dmesg_line below (which packs a 120-byte DmesgLineView@0.1 record before invoking).",
+      block: {
+        mov rax, 115;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // semantic_emit_dmesg_line(log_line_ptr) -> u64
+  //
+  // Pack one KlogPoll log_line record (256 B in-memory) into a
+  // DmesgLineView@0.1 wire record (120 B) and emit it via
+  // sys_semantic_send. Returns whatever sys_semantic_send returns
+  // (0 on success; negative errno-shaped sentinel on failure).
+  //
+  // Contract:
+  //   rdi = log_line_ptr    VA of a 256-byte log_line record as
+  //                         written by KlogPoll::kp_write_line
+  //                         (fields at +0 severity, +8 timestamp_ns,
+  //                         +16 text_ptr, +24 text_len; see
+  //                         klog_poll.pdx §log_line layout).
+  //   -> rax                sys_semantic_send return value
+  //                         (0 = OK; < 0 = failure sentinel).
+  //
+  // Body responsibilities:
+  //   1. Copy severity  (log_line[+0])  -> _se_scratch[+0]
+  //   2. Copy ts_ns     (log_line[+8])  -> _se_scratch[+8]
+  //   3. Zero the entire text_bytes region _se_scratch[+16 .. +112)
+  //      (12 qwords).
+  //   4. min_len = min(text_len, 96).
+  //   5. Byte-copy min_len bytes from text_ptr to _se_scratch[+16].
+  //   6. Store original text_len (log_line[+24]) at _se_scratch[+112].
+  //   7. sys_semantic_send(DMESG_LINE_VIEW_SCHEMA_HASH, _se_scratch, 120).
+  //
+  // The zero-fill happens BEFORE the byte copy so the copy overwrites
+  // the leading min_len bytes and the trailing bytes remain zero.
+  // This eliminates the need to track min_len across a second
+  // (zero-tail) loop -- see §TRUNCATION STRATEGY above.
+  //
+  // Register plan (3-push callee-save prologue = 24 B -> SysV entry
+  // rsp%16==8 + 24 = rsp%16==0 for the nested call to
+  // se_sys_semantic_send):
+  //   rbx = scratch base pointer (VA of _se_scratch); survives the
+  //         zero-fill loop, the byte-copy loop, and the syscall.
+  //   r12 = original text_len (u64); needed for the +112 store AFTER
+  //         the copy loop, which clobbers rcx.
+  //   r13 = text_ptr (u64); source cursor base for the copy loop.
+  //   All other regs (rax / rcx / rdx / r8 / r9 / r10) are SysV
+  //   caller-save scratch; se_sys_semantic_send does not touch
+  //   rbx/r12..r15 (leaf, no callee-save saves) so the values above
+  //   survive the nested call boundary.
+  //
+  // Labels prefixed se_; substring "loop" avoided per encoder-
+  // reserved-keyword discipline. Labels used:
+  //   se_zero_step / se_zero_done   -- qword zero-fill loop
+  //   se_len_ok                      -- min(text_len, 96) fold
+  //   se_copy_step / se_copy_done    -- byte copy loop
+  //
+  // Alignment: entry rsp%16==8; 3 pushes -> rsp%16==0. The single
+  // nested call site (call se_sys_semantic_send) sees rsp%16==0.
+  // 3-pop epilogue restores caller rsp for ret.
+  //
+  // Encoder discipline:
+  //   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+  //   - No imul; no mul.
+  //   - No `and reg, imm64`; no `cmp reg, imm64`. Every immediate
+  //     in cmp / and fits imm8 (0, 8, 16, 96, 112, 120) or imm32.
+  //   - Schema hash 0xE020000144C56501 loaded via `mov rdi, imm64`
+  //     movabs 10-byte encoding (legal for mov; matches kernel
+  //     core/mm/aspace_map.pdx L111 `mov rdi, 0xFFFF800000000000`
+  //     precedent).
+  //   - Every byte load: `xor r8, r8; mov_b r8, [rax]`. Every byte
+  //     store: `mov_b [rdx], r8`.
+  //   - No `cmp reg, [mem]`; every compare loads through a scratch
+  //     first.
+  // ==========================================================================
+  pub let semantic_emit_dmesg_line : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (log_line_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "postui-dmesg.M3-003 (postui-dmesg#5): pack one KlogPoll log_line (256B in-memory) into a DmesgLineView@0.1 wire record (120B) and emit via sys_semantic_send (SC+ sysno 115, paideia-os#2350). 3-push callee-save prologue (rbx=scratch base, r12=original text_len, r13=text_ptr) = 24B -> SysV entry rsp%16==8 + 24 = rsp%16==0 for the nested call to se_sys_semantic_send. Body: (1) lea rbx, [rip + _se_scratch] -- scratch base. (2) Copy severity: mov rax, [rdi + 0]; mov [rbx + 0], rax. (3) Copy timestamp_ns: mov rax, [rdi + 8]; mov [rbx + 8], rax. (4) Load text_ptr into r13 and original text_len into r12: mov r13, [rdi + 16]; mov r12, [rdi + 24]. (5) Zero the entire text_bytes region _se_scratch[+16..+112) as 12 qwords via a small scan loop: xor rax, rax (zero fill); mov rcx, 16 (start); se_zero_step: cmp rcx, 112; jae se_zero_done; lea rdx, [rbx + rcx]; mov [rdx + 0], rax; add rcx, 8; jmp se_zero_step; se_zero_done. rcx=112 at exit but immediately reloaded in step 6. Zero-fill BEFORE byte-copy so the copy overwrites the leading min_len bytes and the trailing bytes remain zero -- eliminates the class of bugs where partial residual from a prior emit leaks into a shorter follow-up record (see §TRUNCATION STRATEGY). (6) Compute min_len = min(text_len, 96): mov rcx, r12; mov rax, 96; cmp rcx, rax; jbe se_len_ok; mov rcx, rax; se_len_ok. rcx now holds min_len (in [0, 96]). Both operands of cmp are register-held; every immediate (96) is imm8. (7) Byte-copy min_len bytes from text_ptr to _se_scratch[+16]: mov rax, r13 (src cursor init); lea rdx, [rbx + 16] (dst cursor init); se_copy_step: cmp rcx, 0; je se_copy_done; xor r8, r8; mov_b r8, [rax]; mov_b [rdx], r8; add rax, 1; add rdx, 1; sub rcx, 1; jmp se_copy_step; se_copy_done. Same byte-copy shape KlogPoll::kp_write_line uses (klog_poll.pdx L505-514). r13/r12/rbx untouched by loop; only rax/rcx/rdx/r8 (all SysV caller-save) get clobbered. Dst cursor rdx advances at most 96 bytes past rbx+16 (loop terminates when rcx=0), so it never reaches +112's field boundary. (8) Store original text_len at +112: mov [rbx + 112], r12. Uses the preserved r12, not the clobbered rcx. (9) Setup sys_semantic_send args and call: mov rdi, 0xE020000144C56501 (movabs 10-byte encoding; imm64 legal for mov but NOT for cmp/and); mov rsi, rbx (record_ptr = scratch base); mov rdx, 120 (record_len -- fits imm8, well under sys_semantic_send's [1, 240] gate); call se_sys_semantic_send. rax now carries the return value. (10) 3-pop epilogue and ret. Encoder discipline: no `test` (cmp reg,0 for the copy loop count check); no imul; no `and reg, imm64` (min-len fold uses cmp+jbe+mov, not `and rcx, 0x7F`); no `cmp reg, [mem]` (every operand register-held); no `mul`. Every immediate (0, 1, 8, 16, 96, 112, 115, 120) fits imm8/imm32; the sole imm64 (schema hash) appears only in `mov reg, imm` form. Every byte load/store uses `xor r8, r8; mov_b r8, [rax]` / `mov_b [rdx], r8` (byte-load-zero-then-mov_b compliance). rbx/r12/r13 are SysV callee-save and remain live across the nested call to se_sys_semantic_send (which touches only rax/rcx/r11 via the SYSCALL entry). Labels prefixed se_ (substring `loop` avoided: se_zero_step / se_zero_done / se_len_ok / se_copy_step / se_copy_done). Sole caller pattern at M3-003: manual invocation from a test harness or a future M4-002 KlogPoll auto-emit hook; the caller is expected to pass a valid log_line_ptr populated by KlogPoll::kp_write_line -- null / unmapped pointers surface as segfaults, matching the M1-001 defensive-gate posture (no validation at this landing; the POSTUI_DMESG_ERR_* band in klog_poll.pdx has sentinels reserved for a future defensive-gate landing).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        // Step 1: load scratch base into rbx (survives every subsequent
+        // load / store / loop / nested call in this function).
+        lea rbx, [rip + _se_scratch];
+
+        // Step 2: copy severity (log_line[+0] -> scratch[+0]).
+        mov rax, [rdi + 0];
+        mov [rbx + 0], rax;
+
+        // Step 3: copy timestamp_ns (log_line[+8] -> scratch[+8]).
+        mov rax, [rdi + 8];
+        mov [rbx + 8], rax;
+
+        // Step 4: load text_ptr and original text_len.
+        mov r13, [rdi + 16];                       // r13 = text_ptr
+        mov r12, [rdi + 24];                       // r12 = text_len (original)
+
+        // Step 5: zero the text_bytes region [+16..+112) as 12 qwords
+        // via a small scan loop (mirrors klog_poll_init's reserved-
+        // region zero loop shape at klog_poll.pdx L612-620).
+        xor rax, rax;                              // fill value = 0
+        mov rcx, 16;                               // cursor start
+        se_zero_step:
+        cmp rcx, 112;
+        jae se_zero_done;
+        lea rdx, [rbx + rcx];
+        mov [rdx + 0], rax;
+        add rcx, 8;
+        jmp se_zero_step;
+        se_zero_done:
+
+        // Step 6: compute min_len = min(text_len, 96) into rcx.
+        mov rcx, r12;
+        mov rax, 96;
+        cmp rcx, rax;
+        jbe se_len_ok;
+        mov rcx, rax;                              // clamp at 96
+        se_len_ok:
+
+        // Step 7: byte-copy min_len bytes from text_ptr to scratch[+16].
+        // Same shape as kp_write_line's copy loop (klog_poll.pdx L505-514).
+        mov rax, r13;                              // rax = src cursor
+        lea rdx, [rbx + 16];                       // rdx = dst cursor
+        se_copy_step:
+        cmp rcx, 0;
+        je se_copy_done;
+        xor r8, r8;
+        mov_b r8, [rax];
+        mov_b [rdx], r8;
+        add rax, 1;
+        add rdx, 1;
+        sub rcx, 1;
+        jmp se_copy_step;
+        se_copy_done:
+
+        // Step 8: store original text_len at +112 (uses preserved r12,
+        // not the clobbered rcx).
+        mov [rbx + 112], r12;
+
+        // Step 9: sys_semantic_send(DMESG_LINE_VIEW_SCHEMA_HASH,
+        //                           _se_scratch, 120).
+        // Schema hash requires movabs (imm64); rsi/rdx fit imm8.
+        mov rdi, 0xE020000144C56501;
+        mov rsi, rbx;
+        mov rdx, 120;
+        call se_sys_semantic_send;
+
+        // Step 10: 3-pop epilogue + return (rax = sys_semantic_send return).
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}
