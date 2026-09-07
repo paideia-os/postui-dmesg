@@ -1,7 +1,7 @@
 // src/view_tabs.pdx -- postui-dmesg.M3-002 (paideia-os/postui-dmesg#4)
 //
 // ViewTabs module: 5-tab horizontal strip
-// [All | Emerg | Err | Warn | Info] gluing postui.M2-007 tabs_draw to
+// [All | Panic | Err | Warn | Info] gluing postui.M2-007 tabs_draw to
 // a persistent selected-tab index.
 //
 // =============================================================================
@@ -21,10 +21,10 @@
 // to view_tabs_match below):
 //
 //   index 0  "All"     every log line the ring holds
-//   index 1  "Emerg"   klog syslog priority 0 (emergency)
-//   index 2  "Err"     klog syslog priority 3 (error)
-//   index 3  "Warn"    klog syslog priority 4 (warning)
-//   index 4  "Info"    klog syslog priority 6 (informational)
+//   index 1  "Panic"   klog LEVEL_PANIC (integer 0, wire letter 'P')
+//   index 2  "Err"     klog LEVEL_ERROR (integer 1, wire letter 'E')
+//   index 3  "Warn"    klog LEVEL_WARN  (integer 2, wire letter 'W')
+//   index 4  "Info"    klog LEVEL_INFO  (integer 3, wire letter 'I')
 //
 // The filter *itself* is applied at the caller: view_list.pdx (M2-001)
 // reads view_tabs_selected() from the poll_tick post-refresh loop and
@@ -35,44 +35,48 @@
 // tab-strip UI.
 //
 // =============================================================================
-// SEVERITY ENCODING (klog syslog priorities)
+// SEVERITY ENCODING (kernel LEVEL_* enum, not syslog priorities)
 // =============================================================================
 //
 // The log_line.severity field (KP_LINE_OFF_SEVERITY = 0 in
-// klog_poll.pdx) carries the klog syslog priority extracted from the
-// leading `<L>` token of each klog wire line. The syslog priority
-// space this module keys against:
+// klog_poll.pdx) carries the kernel LEVEL_* integer extracted from
+// the level field of each klog wire line. The paideia-os klog wire
+// grammar (design/kernel/kernel-logging-substrate.md §3.2) is
 //
-//   0 = emergency  (system unusable)         -> tab index 1 "Emerg"
-//   1 = alert                                -> (not surfaced; falls
-//                                                 through as unmatched)
-//   2 = critical                             -> (not surfaced)
-//   3 = error                                -> tab index 2 "Err"
-//   4 = warning                              -> tab index 3 "Warn"
-//   5 = notice                               -> (not surfaced)
-//   6 = informational                        -> tab index 4 "Info"
-//   7 = debug                                -> (not surfaced)
+//     log-line = tsc "|" cpu "|" level "|" subsys "|" tag ...
+//     level    = "P" / "E" / "W" / "I" / "D" / "T"
 //
-// NOTE: at M1-001 klog_poll.pdx sets severity = 0 as a PLACEHOLDER for
-// every line (see KP_LINE_OFF_SEVERITY comment in klog_poll.pdx L246-
-// 254). The M2 landing extracts the real value from the wire format's
-// leading `<L>` token. Until that parser lands, view_tabs_match
-// against any non-"All" tab returns 0 for every line (severity=0
-// matches only the "Emerg" tab), so the practical effect of tab
-// switching is bounded until M2. This module's contract is the future
-// steady state; the placeholder behavior is caller-visible but
-// correctness is preserved (view_tabs_match with severity=0 returns 1
-// for tabs 0 and 1, 0 for tabs 2/3/4 -- consistent with the emerg
-// mapping).
+// so the level slot is a single ASCII letter -- NOT a numeric syslog
+// priority. Each letter maps 1:1 to the frozen LEVEL_* integers
+// (§4):
 //
-// The kernel's INTERNAL level scheme (design/kernel/kernel-logging-
-// substrate.md §7 LEVEL_PANIC=0/ERROR=1/WARN=2/INFO=3/DEBUG=4/TRACE=5)
-// is a DIFFERENT enumeration; it applies to the composer-side
-// klog_s1(LEVEL_*, ...) API. The wire format that reaches user space
-// via sys_dmesg uses the syslog `<L>` token per §3.3. This module
-// deliberately keys against the wire-format syslog space, NOT the
-// internal LEVEL_* space, matching the intent of the M2 severity-
-// extraction path in klog_poll.pdx.
+//   'P' -> LEVEL_PANIC = 0    system unusable            -> tab 1 "Panic"
+//   'E' -> LEVEL_ERROR = 1    subsystem broken           -> tab 2 "Err"
+//   'W' -> LEVEL_WARN  = 2    unusual state, not a fault -> tab 3 "Warn"
+//   'I' -> LEVEL_INFO  = 3    boot markers / witness OK  -> tab 4 "Info"
+//   'D' -> LEVEL_DEBUG = 4    tracing (off in prod)      -> (not surfaced)
+//   'T' -> LEVEL_TRACE = 5    per-insn (off in prod)     -> (not surfaced)
+//
+// The parser that lands at KlogPoll M2 stores the LEVEL_* integer
+// (0..5) at log_line[+0]; this module's view_tabs_match keys against
+// that integer space directly. Values >= 6 map to "no match" (never
+// produced by the wire grammar, defensive).
+//
+// NOTE: at M1-001 klog_poll.pdx sets severity = 0 as a PLACEHOLDER
+// for every line (see KP_LINE_OFF_SEVERITY comment in klog_poll.pdx
+// L246-254) until the M2 level-letter parser lands. Under the
+// placeholder, view_tabs_match against tab 1 "Panic" returns 1 for
+// every line (severity=0 == LEVEL_PANIC) and 0 for tabs 2/3/4, so
+// the practical effect of tab switching is bounded until M2. This
+// module's contract is the future steady state.
+//
+// The previous revision of this module keyed against a FABRICATED
+// syslog priority space (0/3/4/6 for emerg/err/warn/info). No such
+// wire encoding exists in paideia-os -- the kernel emits letters
+// mapped to the LEVEL_* enum, so the syslog immediates never matched
+// any real line. postui-dmesg#8 corrects that: sel=1 keys against 0
+// (PANIC), sel=2 against 1 (ERROR), sel=3 against 2 (WARN), sel=4
+// against 3 (INFO).
 //
 // =============================================================================
 // DEPENDENCY (postui.M2-007 tabs_draw)
@@ -112,7 +116,7 @@
 //   _vtb_spans        [u8; 120]  120 B   5 Span records (24 B each)
 //   _vtb_spec         [u8; 56]    56 B   TabsSpec
 //   _vtb_lbl_all      [u8; 3]      3 B   "All"
-//   _vtb_lbl_emerg    [u8; 5]      5 B   "Emerg"
+//   _vtb_lbl_panic    [u8; 5]      5 B   "Panic"
 //   _vtb_lbl_err      [u8; 3]      3 B   "Err"
 //   _vtb_lbl_warn     [u8; 4]      4 B   "Warn"
 //   _vtb_lbl_info     [u8; 4]      4 B   "Info"
@@ -162,16 +166,18 @@
 //   view_tabs_match(selected, severity) -> u64
 //     rdi = selected         a tab index in [0..5) (values >= 5 map
 //                            to "no match", returning 0)
-//     rsi = severity         the log_line.severity field (klog syslog
-//                            priority in [0..8))
+//     rsi = severity         the log_line.severity field (kernel
+//                            LEVEL_* integer in [0..6): PANIC=0,
+//                            ERROR=1, WARN=2, INFO=3, DEBUG=4,
+//                            TRACE=5)
 //     -> rax                 1 if severity matches the tab's filter,
 //                            0 otherwise. selected==0 ("All") always
 //                            returns 1 regardless of severity. Table:
 //                              sel=0 -> 1                (all)
-//                              sel=1 -> (sev == 0) ? 1:0 (emerg)
-//                              sel=2 -> (sev == 3) ? 1:0 (err)
-//                              sel=3 -> (sev == 4) ? 1:0 (warn)
-//                              sel=4 -> (sev == 6) ? 1:0 (info)
+//                              sel=1 -> (sev == 0) ? 1:0 (panic)
+//                              sel=2 -> (sev == 1) ? 1:0 (err)
+//                              sel=3 -> (sev == 2) ? 1:0 (warn)
+//                              sel=4 -> (sev == 3) ? 1:0 (info)
 //                              sel>=5 -> 0
 //
 // =============================================================================
@@ -279,22 +285,23 @@ module ViewTabs = structure {
   pub let VTB_TAB_MOD : u64 = 5
 
   // ==========================================================================
-  // Syslog-priority sentinels the view_tabs_match table keys against.
-  // Named locally so the match body reads at the mnemonic (Emerg/Err/
+  // Kernel LEVEL_* sentinels the view_tabs_match table keys against.
+  // Named locally so the match body reads at the mnemonic (Panic/Err/
   // Warn/Info) rather than at the raw digit. See §SEVERITY ENCODING
-  // above for the wire-format rationale.
+  // above for the wire-format rationale (design/kernel/kernel-logging-
+  // substrate.md §3.2 letter grammar + §4 LEVEL_* enum).
   // ==========================================================================
-  pub let VTB_SEV_EMERG : u64 = 0
-  pub let VTB_SEV_ERR   : u64 = 3
-  pub let VTB_SEV_WARN  : u64 = 4
-  pub let VTB_SEV_INFO  : u64 = 6
+  pub let VTB_SEV_PANIC : u64 = 0
+  pub let VTB_SEV_ERR   : u64 = 1
+  pub let VTB_SEV_WARN  : u64 = 2
+  pub let VTB_SEV_INFO  : u64 = 3
 
   // Tab-index sentinels the view_tabs_match dispatch keys against.
   // Kept as named constants so the mapping between tab-index and the
   // filter it applies is legible from the source (rather than as a
   // trail of imm8s in the asm body).
   pub let VTB_TAB_ALL   : u64 = 0
-  pub let VTB_TAB_EMERG : u64 = 1
+  pub let VTB_TAB_PANIC : u64 = 1
   pub let VTB_TAB_ERR   : u64 = 2
   pub let VTB_TAB_WARN  : u64 = 3
   pub let VTB_TAB_INFO  : u64 = 4
@@ -306,7 +313,7 @@ module ViewTabs = structure {
   // discipline).
   // ==========================================================================
   pub let _vtb_lbl_all   : [u8; 3] = "All"
-  pub let _vtb_lbl_emerg : [u8; 5] = "Emerg"
+  pub let _vtb_lbl_panic : [u8; 5] = "Panic"
   pub let _vtb_lbl_err   : [u8; 3] = "Err"
   pub let _vtb_lbl_warn  : [u8; 4] = "Warn"
   pub let _vtb_lbl_info  : [u8; 4] = "Info"
@@ -353,7 +360,7 @@ module ViewTabs = structure {
   //
   // Span offsets (24 B stride):
   //   Span 0 (All):   [+  0] ptr [+  8] byte_len [+ 16] style
-  //   Span 1 (Emerg): [+ 24] ptr [+ 32] byte_len [+ 40] style
+  //   Span 1 (Panic): [+ 24] ptr [+ 32] byte_len [+ 40] style
   //   Span 2 (Err):   [+ 48] ptr [+ 56] byte_len [+ 64] style
   //   Span 3 (Warn):  [+ 72] ptr [+ 80] byte_len [+ 88] style
   //   Span 4 (Info):  [+ 96] ptr [+104] byte_len [+112] style
@@ -361,7 +368,7 @@ module ViewTabs = structure {
   pub let view_tabs_render : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "postui-dmesg.M3-002 (postui-dmesg#4): view_tabs_render is the per-frame Tabs adapter for the 5-tab severity strip [All|Emerg|Err|Warn|Info]. 3-push callee-save prologue (rbx=buf_ptr, r12=rows, r13=cols = 24 bytes) -- entry rsp%16==8, +24==0 for the single nested tabs_draw SysV call; no sub rsp / no stack slots needed (all state in BSS or callee-save regs). Phase 1 (Span stamps into _vtb_spans, 5 records at 24 B stride = 120 B total): lea r10, [rip + _vtb_spans]; for each of 5 tabs stamp (ptr, byte_len, style=0) via `lea r11, [rip + _vtb_lbl_<name>]; mov [r10 + off_ptr], r11; mov rax, <literal_len>; mov [r10 + off_byte_len], rax; xor rax, rax; mov [r10 + off_style], rax`. The `lea r11, [rip + label]` result is the value we want (r11 IS the target), so paideia-as's internal r11-clobber-on-lea is the wanted behavior. Literal lengths (3 for \"All\", 5 for \"Emerg\", 3 for \"Err\", 4 for \"Warn\", 4 for \"Info\") all fit imm8; every Span offset (0/8/16 . . . 112) fits imm8. Phase 2 (TabsSpec stamp into _vtb_spec, 56 B): lea r10, [rip + _vtb_spec]; (a) rect: pack (x=0, y=0, w=cols, h=1) as x | y<<16 | w<<32 | h<<48 -- mov r11, r13 (cols); and r11, 0xFFFF (imm32); shl r11, 32 (imm8); mov rax, 1; and rax, 0xFFFF (imm32, defensive); shl rax, 48 (imm8); or r11, rax; mov [r10 + 0], r11 (x=0, y=0 implicit -- entry cells [0..16) and [16..32) unset in the OR chain remain zero because r11 was constructed only from the shifted w and h bits). (b) titles_ptr: lea r11, [rip + _vtb_spans]; mov [r10 + 8], r11. (c) tab_count = 5: mov rax, 5; mov [r10 + 16], rax. (d) selected: lea r11, [rip + _vt_tabs_state]; mov rax, [r11 + 0]; mov [r10 + 24], rax. (e) divider = 0 (elects default U+2502 '|' via tabs_draw's fixup): xor rax, rax; mov [r10 + 32], rax. (f, g) style_active = 0, style_inactive = 0 (default black-on-white unstyled per Style module wire): mov [r10 + 40], rax; mov [r10 + 48], rax. Phase 3 (dispatch): lea rdi, [rip + _vtb_spec]; mov rsi, rbx (buf_ptr); mov rdx, r12 (rows); mov rcx, r13 (cols); call tabs_draw. rax carries tabs_draw's return verbatim (0 on OK; TAB_ERR_BAND on defensive failure). Epilogue: 3-pop; ret. Encoder discipline: no `test` (no zero-checks in this body); no `and reg, imm64` (widest mask 0xFFFF, imm32); no `imul` (no per-row multiplications -- the 5-tab strip stamps into fixed offsets); no `mul`; no `cmp reg, [mem]` (no compares at all in this body). Every immediate (0, 1, 3, 4, 5, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 0xFFFF) fits imm32; every shift count (16, 32, 48) is imm8. r11 discipline: r11 is used as scratch across the body; every `lea r11, [rip + label]` places the wanted label address into r11 and the internal r11-clobber-on-lea is the exact behavior we depend on. NON-target `lea rN, [rip + ...]` (only two: `lea r10, [rip + _vtb_spans]` at phase 1 start and `lea r10, [rip + _vtb_spec]` at phase 2 start, plus `lea rdi, [rip + _vtb_spec]` at phase 3) clobber r11 but no value of r11 needs to survive those (the next r11 use is another lea into r11). Effect `!{mem}` (spec/span/label reads, spec/span stores, transitive tabs_draw cell writes). Labels prefixed vtb_ per postui fingerprint discipline (no labels needed for this straight-line body).",
+      justification: "postui-dmesg.M3-002 (postui-dmesg#4): view_tabs_render is the per-frame Tabs adapter for the 5-tab severity strip [All|Panic|Err|Warn|Info]. 3-push callee-save prologue (rbx=buf_ptr, r12=rows, r13=cols = 24 bytes) -- entry rsp%16==8, +24==0 for the single nested tabs_draw SysV call; no sub rsp / no stack slots needed (all state in BSS or callee-save regs). Phase 1 (Span stamps into _vtb_spans, 5 records at 24 B stride = 120 B total): lea r10, [rip + _vtb_spans]; for each of 5 tabs stamp (ptr, byte_len, style=0) via `lea r11, [rip + _vtb_lbl_<name>]; mov [r10 + off_ptr], r11; mov rax, <literal_len>; mov [r10 + off_byte_len], rax; xor rax, rax; mov [r10 + off_style], rax`. The `lea r11, [rip + label]` result is the value we want (r11 IS the target), so paideia-as's internal r11-clobber-on-lea is the wanted behavior. Literal lengths (3 for \"All\", 5 for \"Panic\", 3 for \"Err\", 4 for \"Warn\", 4 for \"Info\") all fit imm8; every Span offset (0/8/16 . . . 112) fits imm8. Phase 2 (TabsSpec stamp into _vtb_spec, 56 B): lea r10, [rip + _vtb_spec]; (a) rect: pack (x=0, y=0, w=cols, h=1) as x | y<<16 | w<<32 | h<<48 -- mov r11, r13 (cols); and r11, 0xFFFF (imm32); shl r11, 32 (imm8); mov rax, 1; and rax, 0xFFFF (imm32, defensive); shl rax, 48 (imm8); or r11, rax; mov [r10 + 0], r11 (x=0, y=0 implicit -- entry cells [0..16) and [16..32) unset in the OR chain remain zero because r11 was constructed only from the shifted w and h bits). (b) titles_ptr: lea r11, [rip + _vtb_spans]; mov [r10 + 8], r11. (c) tab_count = 5: mov rax, 5; mov [r10 + 16], rax. (d) selected: lea r11, [rip + _vt_tabs_state]; mov rax, [r11 + 0]; mov [r10 + 24], rax. (e) divider = 0 (elects default U+2502 '|' via tabs_draw's fixup): xor rax, rax; mov [r10 + 32], rax. (f, g) style_active = 0, style_inactive = 0 (default black-on-white unstyled per Style module wire): mov [r10 + 40], rax; mov [r10 + 48], rax. Phase 3 (dispatch): lea rdi, [rip + _vtb_spec]; mov rsi, rbx (buf_ptr); mov rdx, r12 (rows); mov rcx, r13 (cols); call tabs_draw. rax carries tabs_draw's return verbatim (0 on OK; TAB_ERR_BAND on defensive failure). Epilogue: 3-pop; ret. Encoder discipline: no `test` (no zero-checks in this body); no `and reg, imm64` (widest mask 0xFFFF, imm32); no `imul` (no per-row multiplications -- the 5-tab strip stamps into fixed offsets); no `mul`; no `cmp reg, [mem]` (no compares at all in this body). Every immediate (0, 1, 3, 4, 5, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 0xFFFF) fits imm32; every shift count (16, 32, 48) is imm8. r11 discipline: r11 is used as scratch across the body; every `lea r11, [rip + label]` places the wanted label address into r11 and the internal r11-clobber-on-lea is the exact behavior we depend on. NON-target `lea rN, [rip + ...]` (only two: `lea r10, [rip + _vtb_spans]` at phase 1 start and `lea r10, [rip + _vtb_spec]` at phase 2 start, plus `lea rdi, [rip + _vtb_spec]` at phase 3) clobber r11 but no value of r11 needs to survive those (the next r11 use is another lea into r11). Effect `!{mem}` (spec/span/label reads, spec/span stores, transitive tabs_draw cell writes). Labels prefixed vtb_ per postui fingerprint discipline (no labels needed for this straight-line body).",
       block: {
         push rbx;
         push r12;
@@ -382,8 +389,8 @@ module ViewTabs = structure {
         xor rax, rax;
         mov [r10 + 16],  rax;                      // span[0].style = 0
 
-        // Span 1: "Emerg" (5 bytes)
-        lea r11, [rip + _vtb_lbl_emerg];
+        // Span 1: "Panic" (5 bytes)
+        lea r11, [rip + _vtb_lbl_panic];
         mov [r10 + 24],  r11;                      // span[1].ptr
         mov rax, 5;
         mov [r10 + 32],  rax;                      // span[1].byte_len
@@ -575,29 +582,36 @@ module ViewTabs = structure {
   // ==========================================================================
   // view_tabs_match(selected, severity) -> u64
   //
-  // Predicate: does a log_line with the given syslog priority match
-  // the filter for the given tab index? See §SEVERITY ENCODING for
-  // the wire-format rationale.
+  // Predicate: does a log_line with the given kernel LEVEL_* integer
+  // match the filter for the given tab index? See §SEVERITY ENCODING
+  // for the wire-format rationale.
   //
   // Contract:
   //   rdi = selected         a tab index in [0..5); values >= 5 map
   //                          to "no match" (returns 0)
-  //   rsi = severity         the log_line.severity field (klog
-  //                          syslog priority, [0..8))
+  //   rsi = severity         the log_line.severity field (kernel
+  //                          LEVEL_* integer in [0..6): PANIC=0,
+  //                          ERROR=1, WARN=2, INFO=3, DEBUG=4,
+  //                          TRACE=5)
   //   -> rax = 1             match (line survives the filter)
   //   -> rax = 0             no match (line filtered out)
   //
   // Truth table (rows = selected, cols = severity match):
   //   sel = 0 "All"    -> always 1  (matches every severity)
-  //   sel = 1 "Emerg"  -> 1 iff severity == 0
-  //   sel = 2 "Err"    -> 1 iff severity == 3
-  //   sel = 3 "Warn"   -> 1 iff severity == 4
-  //   sel = 4 "Info"   -> 1 iff severity == 6
+  //   sel = 1 "Panic"  -> 1 iff severity == 0  (LEVEL_PANIC)
+  //   sel = 2 "Err"    -> 1 iff severity == 1  (LEVEL_ERROR)
+  //   sel = 3 "Warn"   -> 1 iff severity == 2  (LEVEL_WARN)
+  //   sel = 4 "Info"   -> 1 iff severity == 3  (LEVEL_INFO)
   //   sel >= 5         -> 0 (out of range; defensive)
+  //
+  // DEBUG (4) and TRACE (5) severities never match any surfaced tab
+  // at this landing -- they fall through to the miss arm. A future
+  // "Debug" or "All+verbose" tab landing extends VTB_TAB_COUNT and
+  // adds arms here.
   //
   // Register plan: pure leaf. Uses rdi (selected), rsi (severity),
   // rax (return) only. No pushes, no callee-save touched, no nested
-  // call, no memory access. All immediates (0..6) fit imm8.
+  // call, no memory access. All immediates (0..4) fit imm8.
   //
   // Implementation: dispatch by `selected` through a chain of cmp/je
   // branches. For 5 buckets, a jump-table is not warranted (the
@@ -612,13 +626,13 @@ module ViewTabs = structure {
   pub let view_tabs_match : (u64, u64) -> u64 !{} @{} =
     fn (selected: u64) (severity: u64) -> unsafe {
       effects: {}, capabilities: {},
-      justification: "postui-dmesg.M3-002 (postui-dmesg#4): view_tabs_match is the per-line severity filter predicate. Pure leaf: no push/pop, no callee-save touched, no nested call, no memory access -- register-only over rdi (selected), rsi (severity), rax (return). Body dispatches by `selected` (rdi) through a linear cmp/je chain, then per-arm compares `severity` (rsi) against the arm's expected syslog priority: sel=0 -> return 1 (all); sel=1 -> return (rsi==0)?1:0 (emerg); sel=2 -> return (rsi==3)?1:0 (err); sel=3 -> return (rsi==4)?1:0 (warn); sel=4 -> return (rsi==6)?1:0 (info); sel>=5 -> return 0 (defensive). Wire: cmp rdi, 0; je vtb_match_all; cmp rdi, 1; je vtb_match_emerg; cmp rdi, 2; je vtb_match_err; cmp rdi, 3; je vtb_match_warn; cmp rdi, 4; je vtb_match_info; xor rax, rax; ret. Match arms: vtb_match_all: mov rax, 1; ret. vtb_match_emerg: cmp rsi, 0; je vtb_match_yes; jmp vtb_match_no. vtb_match_err: cmp rsi, 3; je vtb_match_yes; jmp vtb_match_no. vtb_match_warn: cmp rsi, 4; je vtb_match_yes; jmp vtb_match_no. vtb_match_info: cmp rsi, 6; je vtb_match_yes; jmp vtb_match_no. vtb_match_yes: mov rax, 1; ret. vtb_match_no: xor rax, rax; ret. Encoder discipline: no `test` (every zero-check via cmp reg, 0); no imul; no `and reg, imm`; no `cmp reg, [mem]` (all compares are reg-to-imm8); no lea (register-only, so no r11-clobber concern); no cross-module call. Every immediate (0, 1, 2, 3, 4, 6) fits imm8. Effect `!{}` (no memory read, no memory write, no sysreg). Return values are strictly 0 or 1. Labels prefixed vtb_match_ per fingerprint discipline (substring `loop` avoided).",
+      justification: "postui-dmesg.M3-002 (postui-dmesg#4) as corrected by postui-dmesg#8: view_tabs_match is the per-line severity filter predicate. Keys against the kernel LEVEL_* integer space per design/kernel/kernel-logging-substrate.md §3.2 (wire letter grammar 'P'/'E'/'W'/'I'/'D'/'T') and §4 (LEVEL_PANIC=0/ERROR=1/WARN=2/INFO=3/DEBUG=4/TRACE=5); the previous revision keyed against a fabricated syslog priority space (0/3/4/6) that never appeared in any paideia-os wire line -- #8 fixes that. Pure leaf: no push/pop, no callee-save touched, no nested call, no memory access -- register-only over rdi (selected), rsi (severity), rax (return). Body dispatches by `selected` (rdi) through a linear cmp/je chain, then per-arm compares `severity` (rsi) against the arm's expected LEVEL_* integer: sel=0 -> return 1 (all); sel=1 -> return (rsi==0)?1:0 (panic); sel=2 -> return (rsi==1)?1:0 (err); sel=3 -> return (rsi==2)?1:0 (warn); sel=4 -> return (rsi==3)?1:0 (info); sel>=5 -> return 0 (defensive). Wire: cmp rdi, 0; je vtb_match_all; cmp rdi, 1; je vtb_match_panic; cmp rdi, 2; je vtb_match_err; cmp rdi, 3; je vtb_match_warn; cmp rdi, 4; je vtb_match_info; xor rax, rax; ret. Match arms: vtb_match_all: mov rax, 1; ret. vtb_match_panic: cmp rsi, 0; je vtb_match_yes; jmp vtb_match_no. vtb_match_err: cmp rsi, 1; je vtb_match_yes; jmp vtb_match_no. vtb_match_warn: cmp rsi, 2; je vtb_match_yes; jmp vtb_match_no. vtb_match_info: cmp rsi, 3; je vtb_match_yes; jmp vtb_match_no. vtb_match_yes: mov rax, 1; ret. vtb_match_no: xor rax, rax; ret. Encoder discipline: no `test` (every zero-check via cmp reg, 0); no imul; no `and reg, imm`; no `cmp reg, [mem]` (all compares are reg-to-imm8); no lea (register-only, so no r11-clobber concern); no cross-module call. Every immediate (0, 1, 2, 3, 4) fits imm8. Effect `!{}` (no memory read, no memory write, no sysreg). Return values are strictly 0 or 1. Labels prefixed vtb_match_ per fingerprint discipline (substring `loop` avoided).",
       block: {
         // ---- Dispatch by `selected` ----------------------------------------
         cmp rdi, 0;
         je vtb_match_all;
         cmp rdi, 1;
-        je vtb_match_emerg;
+        je vtb_match_panic;
         cmp rdi, 2;
         je vtb_match_err;
         cmp rdi, 3;
@@ -634,23 +648,23 @@ module ViewTabs = structure {
         mov rax, 1;
         ret;
 
-      vtb_match_emerg:
-        cmp rsi, 0;                                // syslog priority: emergency
+      vtb_match_panic:
+        cmp rsi, 0;                                // LEVEL_PANIC
         je vtb_match_yes;
         jmp vtb_match_no;
 
       vtb_match_err:
-        cmp rsi, 3;                                // syslog priority: error
+        cmp rsi, 1;                                // LEVEL_ERROR
         je vtb_match_yes;
         jmp vtb_match_no;
 
       vtb_match_warn:
-        cmp rsi, 4;                                // syslog priority: warning
+        cmp rsi, 2;                                // LEVEL_WARN
         je vtb_match_yes;
         jmp vtb_match_no;
 
       vtb_match_info:
-        cmp rsi, 6;                                // syslog priority: informational
+        cmp rsi, 3;                                // LEVEL_INFO
         je vtb_match_yes;
         jmp vtb_match_no;
 

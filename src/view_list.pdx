@@ -105,7 +105,10 @@
 //
 // One log_line -> one Line -> one Span. Multi-Span lines (e.g. severity-
 // colored prefix + message body) become natural in the M2-002+ landing
-// that parses the klog wire format's `<L>` severity token: that landing
+// that parses the klog wire format's positional level letter (the
+// third `|`-separated field, one of {P,E,W,I,D,T} mapping to the
+// LEVEL_* enum per design/kernel/kernel-logging-substrate.md §3.2
+// grammar + §4 enum; NOT a syslog `<L>` priority token): that landing
 // simply overwrites _vl_spans[i] with (LINE_TEXT_MAX/N)-byte segments
 // carrying differing style words, keeping the Line's span_count field
 // re-derived per frame.

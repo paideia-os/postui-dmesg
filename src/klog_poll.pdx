@@ -245,13 +245,20 @@ module KlogPoll = structure {
   //
   //   [+0]    severity     (u64)   PLACEHOLDER at M1-001 (always 0).
   //                                Real severity extraction from the
-  //                                klog wire format (level letter in
-  //                                the leading `<L>` token per
-  //                                paideia-os design/kernel/kernel-
-  //                                logging-substrate.md §6.2) is a M2
+  //                                klog wire format (the third `|`-
+  //                                separated field, a single ASCII
+  //                                letter from {P,E,W,I,D,T}
+  //                                mapping to the frozen LEVEL_*
+  //                                integers PANIC=0 / ERROR=1 /
+  //                                WARN=2 / INFO=3 / DEBUG=4 /
+  //                                TRACE=5 per paideia-os design/
+  //                                kernel/kernel-logging-substrate.md
+  //                                §3.2 grammar + §4 enum) is a M2
   //                                item that lands with the List
   //                                widget's per-severity color
-  //                                mapping.
+  //                                mapping. NOT a syslog priority
+  //                                (no `<L>` token exists in the
+  //                                paideia-os klog wire format).
   //   [+8]    timestamp_ns (u64)   Monotonic ns snapshot at the poll
   //                                that read this line. NOT the
   //                                per-line TSC embedded in the klog
