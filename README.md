@@ -23,8 +23,6 @@ cap-slots land.
 
 ## Known follow-ups
 
-- **postui-dmesg#7** — POSTUI_DMESG_ERR_BAND collides with postui-hex
-  at 0xFFFFE010..1F; needs relocation to 0xFFFFE020..2F.
 - **postui-dmesg#8** — view_tabs severity mapping uses fabricated
   syslog priorities (0=emerg/3=err/4=warn/6=info); paideia-os actually
   uses LEVEL_* (0=PANIC..5=TRACE). Mapping + tab labels need rewrite;

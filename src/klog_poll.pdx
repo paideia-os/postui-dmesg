@@ -108,7 +108,7 @@
 //     basename klog_poll.pdx.
 //   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
 //   - Every immediate in cmp / and fits imm32 (<= 0x7FFFFFFF). The
-//     large sentinel band 0xFFFFE01x is only used in `mov reg, imm`
+//     large sentinel band 0xFFFFE02x is only used in `mov reg, imm`
 //     form -- paideia-as emits the 10-byte movabs encoding for
 //     imm > 0x7FFFFFFF, legal for mov but NOT for cmp/and.
 //   - No 2-op `imul reg, imm` anywhere; no imul used at all. Row-
@@ -140,23 +140,46 @@ module KlogPoll = structure {
   // ==========================================================================
   // Error band (postui-dmesg's wave-scoped high-nibble discriminator).
   //
-  // The M1-001 issue text proposed 0xFFFFEC20..0xFFFFEC2F. That band
-  // is NOT free -- paideia-os/src/kernel/core/cap/kind_pdxfs_file.pdx
-  // SECTION 3 ("FAILURE TAXONOMY -- 0xFFFFEC20..0xFFFFEC2F") claims
-  // the entire sub-range end to end (PFF_TAIL_ENOSPC=0xFFFFEC2F down
-  // to PFF_REVOKE_ALREADY=0xFFFFEC26 with a fully-allocated centre).
-  // Populating our band there would collide byte-for-byte with live
-  // KIND_PDXFS_FILE return codes. The postui-top#1 debugger-audit
-  // fixup (postui-work/postui-top/src/poll.pdx §Error band) hit the
-  // exact same issue on 0xFFFFEC0x and relocated postui-top to
-  // 0xFFFFE000..0xFFFFE00F.
+  // Relocation history for this band across the postui-dmesg wave:
+  //   Round 1 (M1-001 landing draft): 0xFFFFEC20..0xFFFFEC2F -- REJECTED
+  //     because paideia-os/src/kernel/core/cap/kind_pdxfs_file.pdx
+  //     SECTION 3 ("FAILURE TAXONOMY -- 0xFFFFEC20..0xFFFFEC2F")
+  //     claims the entire sub-range end to end
+  //     (PFF_TAIL_ENOSPC=0xFFFFEC2F down to PFF_REVOKE_ALREADY=
+  //     0xFFFFEC26 with a fully-allocated centre). Populating our
+  //     band there would collide byte-for-byte with live KIND_
+  //     PDXFS_FILE return codes. The postui-top#1 debugger-audit
+  //     fixup (postui-work/postui-top/src/poll.pdx §Error band) hit
+  //     the same issue on 0xFFFFEC0x and relocated postui-top to
+  //     0xFFFFE000..0xFFFFE00F.
   //
-  // FIX: postui-dmesg takes 0xFFFFE010..0xFFFFE01F, adjacent to
-  // postui-top's 0xFFFFE000..0xFFFFE00F in the wave-free
-  // 0xFFFFE0xx page. Verified by grep of the full 0xFFFFE01x range
-  // across paideia-os (src/, design/, tools/) and the postui-work
-  // sibling repos (postui, postui-top, postui-dmesg, postui-hex):
-  // zero collisions.
+  //   Round 2 (M1-001 landing): 0xFFFFE010..0xFFFFE01F -- REJECTED
+  //     by postui-dmesg#7 because postui-hex's own M1-001 debugger-
+  //     audit fixup relocated its POSTUI_HEX_ERR_BAND to the same
+  //     0xFFFFE010..0xFFFFE01F sub-slice (adjacent to postui-top).
+  //     Two apps in the same wave cannot share a sentinel band --
+  //     downstream diagnostic tooling that maps a fail-code back to
+  //     its emitting app relies on band-uniqueness across the wave.
+  //
+  //   Round 3 (postui-dmesg#7 landing, CURRENT): 0xFFFFE020..
+  //     0xFFFFE02F -- the next contiguous slot in the wave-free
+  //     0xFFFFE0xx page, immediately above postui-hex's slot,
+  //     keeping the wave apps clustered:
+  //       postui-top    0xFFFFE000..0xFFFFE00F  (app ERR band)
+  //       postui-hex    0xFFFFE010..0xFFFFE01F  (app ERR band)
+  //       postui-dmesg  0xFFFFE020..0xFFFFE02F  (app ERR band, THIS)
+  //     The 0xFFFFE030..0xFFFFE0DF interior stays reserved for
+  //     future wave satellites; 0xFFFFE0E0..0xFFFFE0EF is claimed
+  //     by tests/boot_dmesg_smoke.pdx as postui-dmesg's own boot-
+  //     smoke fingerprint band (mirrors postui-hex's tests/boot_
+  //     hex_smoke.pdx convention at 0xFFFFE0F0..0xFFFFE0FF for
+  //     test fingerprints, keeping app ERR bands and test
+  //     fingerprint bands at opposite ends of the page).
+  //
+  // Verified by grep of `0xFFFFE02[0-9A-F]` across paideia-os
+  // (src/, design/, tools/) and the postui-work sibling repos
+  // (postui, postui-top, postui-dmesg, postui-hex): zero collisions
+  // outside this file's own declarations.
   //
   // Sentinels within the postui-dmesg band are allocated bottom-up:
   //   +0  KP_ERR_BAD_STATE_PTR      klog_poll_init/tick with a null state
@@ -173,13 +196,13 @@ module KlogPoll = structure {
   // landing does not need to introduce them.
   // ==========================================================================
   pub let POSTUI_DMESG_OK                : u64 = 0
-  pub let POSTUI_DMESG_ERR_BAND_BASE     : u64 = 0xFFFFE010
-  pub let POSTUI_DMESG_ERR_BAND_TOP      : u64 = 0xFFFFE01F
+  pub let POSTUI_DMESG_ERR_BAND_BASE     : u64 = 0xFFFFE020
+  pub let POSTUI_DMESG_ERR_BAND_TOP      : u64 = 0xFFFFE02F
 
-  pub let KP_ERR_BAD_STATE_PTR           : u64 = 0xFFFFE010
-  pub let KP_ERR_BAD_LINES_PTR           : u64 = 0xFFFFE011
-  pub let KP_ERR_BAD_LINE_CAP            : u64 = 0xFFFFE012
-  pub let KP_ERR_INTERVAL_ZERO           : u64 = 0xFFFFE013
+  pub let KP_ERR_BAD_STATE_PTR           : u64 = 0xFFFFE020
+  pub let KP_ERR_BAD_LINES_PTR           : u64 = 0xFFFFE021
+  pub let KP_ERR_BAD_LINE_CAP            : u64 = 0xFFFFE022
+  pub let KP_ERR_INTERVAL_ZERO           : u64 = 0xFFFFE023
 
   // ==========================================================================
   // KlogState layout (128 bytes, 16 qwords, @align(64) -- fits in

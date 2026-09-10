@@ -72,7 +72,9 @@ deps:
 # below becomes a `paideia-as build --tests` target once the
 # corresponding issue lands.
 # Fail-code family bands for postui-dmesg per design/architecture.md:
-#   test_klog_poll_tick_fingerprint     0xFFFFE01x band  (M1-004)
+#   KlogPoll KP_ERR_* app band          0xFFFFE020..0xFFFFE02F  (postui-dmesg#7)
+#   BootDmesgSmoke fingerprint band     0xFFFFE0E0..0xFFFFE0EF  (tests/boot_dmesg_smoke.pdx)
+#   test_klog_poll_tick_fingerprint     0xFFFFE0Ex band  (M1-004; sub-band of BootDmesgSmoke)
 tests:
   # (empty at M1-001; M1-004 adds tests/test_klog_poll_tick_fingerprint.pdx)
 

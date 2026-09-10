@@ -23,8 +23,9 @@
 //     Zero every FilterState field, point filter_ptr at the inline text
 //     buffer, and set filter_capacity to VF_INLINE_BUF_BYTES (112).
 //     Returns 0 unconditionally (no validation gate at v1; a future
-//     landing may reserve a VF_ERR_* band in 0xFFFFE01x for null-state
-//     and cursor-out-of-range diagnostics).
+//     landing may reserve a VF_ERR_* band in 0xFFFFE02x for null-state
+//     and cursor-out-of-range diagnostics -- see src/klog_poll.pdx
+//     §Error band for the post-postui-dmesg#7 app-band anchor).
 //
 //   view_filter_input(state, key_code) -> u64
 //     Translate one keyboard key code into either an insert-byte or
@@ -407,10 +408,10 @@ module ViewFilter = structure {
   // ==========================================================================
   // Return sentinel (v1). Every entry returns 0 on success (VF_OK); the
   // M3-001 landing does not introduce any VF_ERR_* sentinel -- input
-  // errors are silent no-ops. The 0xFFFFE01x band claimed by KlogPoll
-  // has slots +4..+F reserved for postui-dmesg's M1-002+ diagnostics;
-  // ViewFilter can reserve a sub-band at a later landing without
-  // colliding.
+  // errors are silent no-ops. The 0xFFFFE02x band claimed by KlogPoll
+  // (post-postui-dmesg#7; formerly 0xFFFFE01x) has slots +4..+F
+  // reserved for postui-dmesg's M1-002+ diagnostics; ViewFilter can
+  // reserve a sub-band at a later landing without colliding.
   // ==========================================================================
   pub let VF_OK : u64 = 0
 

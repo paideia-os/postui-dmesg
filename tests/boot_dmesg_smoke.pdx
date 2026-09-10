@@ -28,10 +28,17 @@
 // eventual `paideia-as build --tests` target) is exercised at
 // release-close time. The body remains a follow-up:
 //
-//   * postui-dmesg#7 relocates the fail-code band from 0xFFFFE01x
-//     (occupied by KlogPoll's KP_ERR_* range) to 0xFFFFE020..
-//     0xFFFFE02F to avoid symbol overlap; every sentinel this file
-//     will declare belongs to the new band.
+//   * postui-dmesg#7 relocates KlogPoll's KP_ERR_* app fail-code
+//     band from 0xFFFFE010..0xFFFFE01F (which collided with
+//     postui-hex's own POSTUI_HEX_ERR_BAND at the same address) to
+//     0xFFFFE020..0xFFFFE02F. That is now the postui-dmesg APP
+//     band, so this test module's fingerprint band relocates to
+//     0xFFFFE0E0..0xFFFFE0EF -- the last-but-one slot on the
+//     0xFFFFE0xx page, mirroring postui-hex/tests/boot_hex_smoke.
+//     pdx's own fingerprint band at 0xFFFFE0F0..0xFFFFE0FF (test
+//     fingerprint bands cluster at the high end of the page; app
+//     ERR bands cluster at the low end). Every sentinel this file
+//     will declare belongs to the new fingerprint band.
 //   * postui-dmesg#8 replaces the fabricated syslog priorities the
 //     current view_tabs_match keys against with the frozen LEVEL_*
 //     enum from paideia-os/kind_dmesg upstream.
@@ -55,22 +62,33 @@ module BootDmesgSmoke = structure {
 
   // Fail-code band for BootDmesgSmoke.
   //
-  // KP_ERR_* in src/klog_poll.pdx already occupies 0xFFFFE010..
-  // 0xFFFFE01F; the M4 placeholder reserves the adjacent 0xFFFFE020..
-  // 0xFFFFE02F range for boot-smoke step sentinels. postui-dmesg#7
-  // is the tracking issue for band relocation across the wave --
-  // the constants below are declared now so a later body landing
+  // After postui-dmesg#7 KlogPoll's KP_ERR_* app band lives at
+  // 0xFFFFE020..0xFFFFE02F; this test module reserves a distinct
+  // fingerprint band at 0xFFFFE0E0..0xFFFFE0EF (mirrors postui-hex/
+  // tests/boot_hex_smoke.pdx's BHS_FINGERPRINT_BAND at 0xFFFFE0F0..
+  // 0xFFFFE0FF). The high-end-of-page convention keeps every
+  // wave's per-app boot-smoke fingerprints clustered together and
+  // separated from the low-end app ERR bands, so a fail-code lookup
+  // downstream can partition "app runtime failure" from "boot-smoke
+  // step regression" by high nibble alone.
+  //
+  // The constants below are declared now so a later body landing
   // does not have to churn a caps.decl re-sign for numeric shuffles.
-  pub let SMOKE_ERR_BAND_BASE : u64 = 0xFFFFE020
-  pub let SMOKE_ERR_BAND_TOP  : u64 = 0xFFFFE02F
+  pub let SMOKE_ERR_BAND_BASE : u64 = 0xFFFFE0E0
+  pub let SMOKE_ERR_BAND_TOP  : u64 = 0xFFFFE0EF
 
   // Placeholder entry point. Returns 0 unconditionally at v1.0.0.
   // Downstream harnesses may already link against this symbol; the
   // return value is the future contract (0 = pass, band sentinel =
   // fail at step N).
-  pub fn boot_dmesg_smoke() -> u64 {
-    xor rax, rax
-    ret
-  }
+  pub let boot_dmesg_smoke : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Placeholder entry point per M4 rollout — returns 0 unconditionally at v1.0.0; downstream harnesses link against this symbol. The future contract is 0=pass, band sentinel=fail at step N. paideia-as 0.36 drift fix (postui-dmesg#7): earlier `pub fn` syntax retired in favor of the `pub let : sig = fn ... -> unsafe { justification, block }` shape the rest of the tree already uses.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    }
 
 }
